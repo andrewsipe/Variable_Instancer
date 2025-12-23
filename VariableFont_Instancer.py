@@ -1851,7 +1851,7 @@ class InstanceGenerator:
 
             # Dry-run mode: log what would be saved without actually saving
             if self.config.dry_run:
-                logger.info(f"[DRY-RUN] Would save: {output_path}")
+                logger.info(f"Would save: {output_path}")
                 return str(output_path)
 
             # Attempt to save with race condition handling
@@ -1935,19 +1935,15 @@ class FontProcessor:
                 break
 
             coordinates, custom_name = result
-            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
-            print(f"\n{dry_run_prefix}Generating: {custom_name}")
+            print(f"\nGenerating: {custom_name}")
             output_path = generator.generate_instance(coordinates, custom_name)
 
             if output_path:
                 filename = Path(output_path).name
                 cs.emit("")
-                status_msg = (
-                    f"{dry_run_prefix}Generated" if dry_run_prefix else "Generated"
-                )
-                StatusIndicator("success").add_message(status_msg).add_file(
-                    filename, filename_only=True
-                ).emit()
+                StatusIndicator("success", dry_run=self.config.dry_run).add_message(
+                    "Generated"
+                ).add_file(filename, filename_only=True).emit()
 
             another = input("\nCreate another instance? [y/N]: ").strip().lower()
             if another not in ["y", "yes"]:
@@ -1955,9 +1951,8 @@ class FontProcessor:
 
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
-            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             print(
-                f"\n{dry_run_prefix}Generated {generator.successful_count} instance(s) in: {output_dir}"
+                f"\nGenerated {generator.successful_count} instance(s) in: {output_dir}"
             )
 
     def run_instance_mode(self) -> None:
@@ -1989,9 +1984,8 @@ class FontProcessor:
         self.last_generator = generator
 
         if not instances_with_modes:  # Generate all
-            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             cs.emit(
-                f"\n{dry_run_prefix}Generating {cs.fmt_count(len(self.metadata.instances))} instances..."
+                f"\nGenerating {cs.fmt_count(len(self.metadata.instances))} instances..."
             )
 
             for inst_num, inst in enumerate(self.metadata.instances, 1):
@@ -2000,13 +1994,11 @@ class FontProcessor:
                 output_path = generator.generate_instance(inst.coordinates, final_name)
                 if output_path:
                     filename = Path(output_path).name
-                    dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
-                    cs.emit(f"  [{inst_num}] {dry_run_prefix}Generated: {filename}")
+                    cs.emit(f"  [{inst_num}] Generated: {filename}")
 
         else:  # Generate specific instances
-            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             cs.emit(
-                f"\n{dry_run_prefix}Generating {cs.fmt_count(len(instances_with_modes))} instance(s)..."
+                f"\nGenerating {cs.fmt_count(len(instances_with_modes))} instance(s)..."
             )
 
             for idx, mode in instances_with_modes:
@@ -2022,15 +2014,13 @@ class FontProcessor:
                 output_path = generator.generate_instance(inst.coordinates, final_name)
                 if output_path:
                     filename = Path(output_path).name
-                    dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
-                    cs.emit(f"  [{inst_num}] {dry_run_prefix}Generated: {filename}")
+                    cs.emit(f"  [{inst_num}] Generated: {filename}")
 
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
             cs.emit("")
-            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
-            StatusIndicator("success").add_message(
-                f"{dry_run_prefix}Generated {cs.fmt_count(generator.successful_count)} instance(s)"
+            StatusIndicator("success", dry_run=self.config.dry_run).add_message(
+                f"Generated {cs.fmt_count(generator.successful_count)} instance(s)"
             ).add_item(
                 f"Output directory: {cs.fmt_file_compact(str(output_dir))}"
             ).emit()
@@ -2058,9 +2048,8 @@ class FontProcessor:
         self.last_generator = generator
 
         mode_label = self.config.naming_mode.value
-        dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
         cs.emit(
-            f"{dry_run_prefix}Auto-generating {cs.fmt_count(len(self.metadata.instances))} instances ({mode_label} names)..."
+            f"Auto-generating {cs.fmt_count(len(self.metadata.instances))} instances ({mode_label} names)..."
         )
 
         for inst_num, inst in enumerate(self.metadata.instances, 1):
@@ -2074,9 +2063,8 @@ class FontProcessor:
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
             cs.emit("")
-            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
-            StatusIndicator("success").add_message(
-                f"{dry_run_prefix}Generated {cs.fmt_count(generator.successful_count)} instance(s)"
+            StatusIndicator("success", dry_run=self.config.dry_run).add_message(
+                f"Generated {cs.fmt_count(generator.successful_count)} instance(s)"
             ).add_item(f"Output: {cs.fmt_file_compact(str(output_dir))}").emit()
 
 
