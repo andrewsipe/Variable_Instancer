@@ -29,13 +29,14 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
 from fontTools.ttLib import TTFont
 from fontTools.varLib import instancer
 from typing import Optional, List, Dict, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 
 # Add project root to path for FontCore imports (works for root and subdirectory scripts)
@@ -1899,16 +1900,31 @@ class FontProcessor:
         self.stat_parser: Optional[STATNameParser] = None
         self.last_generator: Optional[InstanceGenerator] = None
 
-    def run_info_mode(self) -> None:
+    def run_info_mode(self, json_output: bool = False) -> None:
         """Run information-only mode."""
         if not self.analyzer.load_and_validate():
+            if json_output:
+                print(json.dumps({"error": "Failed to load or validate font"}))
             return
 
         self.metadata = self.analyzer.analyze()
         self.stat_parser = self.analyzer.stat_parser
 
-        ui = InteractivePrompt(self.metadata, self.stat_parser)
-        ui.show_info_mode()
+        if json_output:
+            # Output JSON format
+            output = {
+                "axes": [asdict(axis) for axis in self.metadata.axes],
+                "instances": [asdict(inst) for inst in self.metadata.instances],
+                "stat_values": {
+                    axis_tag: {str(val): name for val, name in values.items()}
+                    for axis_tag, values in self.metadata.stat_values.items()
+                },
+                "source_italic": self.metadata.source_italic,
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            ui = InteractivePrompt(self.metadata, self.stat_parser)
+            ui.show_info_mode()
 
     def run_custom_mode(self) -> None:
         """Run custom instance creation mode."""
@@ -2025,15 +2041,20 @@ class FontProcessor:
                 f"Output directory: {cs.fmt_file_compact(str(output_dir))}"
             ).emit()
 
-    def run_auto_mode(self) -> None:
-        """Run automatic generation mode (no prompts)."""
+    def run_auto_mode(self, json_output: bool = False, instance_indices: Optional[List[int]] = None) -> None:
+        """Run automatic generation mode (no prompts).
+        
+        Args:
+            json_output: If True, output JSON instead of console messages
+            instance_indices: Optional list of instance indices to generate (0-based). If None, generates all.
+        """
         if not self.analyzer.load_and_validate():
+            if json_output:
+                print(json.dumps({"error": "Failed to load or validate font"}))
             return
 
         self.metadata = self.analyzer.analyze()
         self.stat_parser = self.analyzer.stat_parser
-
-        # Verbose mode removed - all info shown by default
 
         naming_strategy = InstanceNamingStrategy(
             self.metadata, self.stat_parser, self.config.naming_mode
@@ -2047,20 +2068,47 @@ class FontProcessor:
         )
         self.last_generator = generator
 
-        mode_label = self.config.naming_mode.value
-        cs.emit(
-            f"Auto-generating {cs.fmt_count(len(self.metadata.instances))} instances ({mode_label} names)..."
-        )
+        # Filter instances if indices specified
+        instances_to_generate = self.metadata.instances
+        if instance_indices is not None:
+            instances_to_generate = [
+                inst for inst in self.metadata.instances
+                if inst.index in instance_indices
+            ]
 
-        for inst_num, inst in enumerate(self.metadata.instances, 1):
+        if not json_output:
+            mode_label = self.config.naming_mode.value
+            cs.emit(
+                f"Auto-generating {cs.fmt_count(len(instances_to_generate))} instances ({mode_label} names)..."
+            )
+
+        generated_files = []
+        for inst_num, inst in enumerate(instances_to_generate, 1):
             final_name = naming_strategy.resolve_name(inst)
 
             output_path = generator.generate_instance(inst.coordinates, final_name)
             if output_path:
                 filename = Path(output_path).name
-                cs.emit(f"  [{inst_num}] Generated: {filename}")
+                if json_output:
+                    generated_files.append({
+                        "instance_index": inst.index,
+                        "name": final_name,
+                        "filename": filename,
+                        "path": output_path
+                    })
+                else:
+                    cs.emit(f"  [{inst_num}] Generated: {filename}")
 
-        if generator.successful_count > 0:
+        if json_output:
+            output = {
+                "success": generator.successful_count > 0,
+                "generated_count": generator.successful_count,
+                "total_instances": len(self.metadata.instances),
+                "files": generated_files,
+                "output_dir": str(self.config.output_dir or Path(self.font_path).parent)
+            }
+            print(json.dumps(output, indent=2))
+        elif generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
             cs.emit("")
             StatusIndicator("success", dry_run=self.config.dry_run).add_message(
@@ -2091,6 +2139,11 @@ def main():
             description="Display comprehensive font information including axes, instances, and validation notices",
         )
         info_parser.add_argument("font", help="Variable font file to analyze")
+        info_parser.add_argument(
+            "--json",
+            action="store_true",
+            help="Output results as JSON (for app integration)",
+        )
 
         # Custom subcommand
         custom_parser = subparsers.add_parser(
@@ -2328,31 +2381,56 @@ fvar-raw Names (-r)
         action="store_true",
         help="Preview mode: show what would be done without generating files",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results as JSON (for app integration)",
+    )
 
     args = parser.parse_args()
+    
+    # Use module-level console, override only when JSON mode
+    # (must reference global to avoid UnboundLocalError)
+    global console
+    console_output = console
+    
+    # Disable rich console output when --json is present
+    if args.json:
+        import logging
+        logging.basicConfig(level=logging.ERROR)
+        cs.RICH_AVAILABLE = False
+        # Suppress console output
+        console_output = None
 
     # Handle subcommands (info, custom)
     if hasattr(args, "command") and args.command == "info":
         # Info mode with single font
         if not Path(args.font).exists():
-            StatusIndicator("error").add_message("Font file not found").add_file(
-                args.font, filename_only=False
-            ).emit()
+            if args.json:
+                print(json.dumps({"error": f"Font file not found: {args.font}"}))
+            else:
+                StatusIndicator("error").add_message("Font file not found").add_file(
+                    args.font, filename_only=False
+                ).emit()
             return 1
 
-        cs.fmt_header("Variable Font Instancer - Font Information", console)
+        if not args.json:
+            cs.fmt_header("Variable Font Instancer - Font Information", console_output)
 
         # Create minimal config for info mode
         config = InstancerConfig()
         processor = FontProcessor(args.font, config)
 
         try:
-            processor.run_info_mode()
+            processor.run_info_mode(json_output=args.json)
         except Exception as e:
-            logger.error(f"Failed to analyze {args.font}: {e}")
-            StatusIndicator("error").add_message(
-                "Failed to analyze font"
-            ).with_explanation(str(e)).emit()
+            if args.json:
+                print(json.dumps({"error": f"Failed to analyze font: {str(e)}"}))
+            else:
+                logger.error(f"Failed to analyze {args.font}: {e}")
+                StatusIndicator("error").add_message(
+                    "Failed to analyze font"
+                ).with_explanation(str(e)).emit()
             return 1
 
         return 0
@@ -2365,7 +2443,7 @@ fvar-raw Names (-r)
             ).emit()
             return 1
 
-        cs.fmt_header("Variable Font Instancer - Custom Instance Builder", console)
+        cs.fmt_header("Variable Font Instancer - Custom Instance Builder", console_output)
 
         # Create config for custom mode
         config = InstancerConfig(
@@ -2473,7 +2551,7 @@ fvar-raw Names (-r)
     )
 
     # Show header
-    cs.fmt_header("Variable Font Instancer - Extract static instances", console)
+    cs.fmt_header("Variable Font Instancer - Extract static instances", console_output)
 
     if len(font_files) > 1:
         StatusIndicator("info").add_message(
@@ -2502,7 +2580,25 @@ fvar-raw Names (-r)
 
             try:
                 if args.yes:
-                    processor.run_auto_mode()
+                    # Parse instance indices if --instance specified
+                    instance_indices = None
+                    if args.instance:
+                        # Load metadata first to validate indices
+                        if processor.analyzer.load_and_validate():
+                            processor.metadata = processor.analyzer.analyze()
+                            try:
+                                # Parse comma-separated list (1-based, convert to 0-based)
+                                indices = [int(x.strip()) - 1 for x in args.instance.split(",")]
+                                # Validate indices
+                                if processor.metadata:
+                                    instance_indices = [
+                                        idx for idx in indices 
+                                        if 0 <= idx < len(processor.metadata.instances)
+                                    ]
+                            except (ValueError, AttributeError):
+                                pass  # Invalid format, generate all
+                    
+                    processor.run_auto_mode(json_output=args.json, instance_indices=instance_indices)
                     if hasattr(processor, "metadata") and processor.metadata:
                         # Count successful instances
                         if (
