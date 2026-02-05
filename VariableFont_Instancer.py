@@ -2115,6 +2115,136 @@ class FontProcessor:
                 f"Generated {cs.fmt_count(generator.successful_count)} instance(s)"
             ).add_item(f"Output: {cs.fmt_file_compact(str(output_dir))}").emit()
 
+    def run_instances_json_mode(
+        self, instances_list: List[Dict], json_output: bool = False
+    ) -> None:
+        """Run generation from a list of instance definitions (name + coordinates).
+
+        Each item in instances_list must have "name" and "coordinates".
+        Validates axis tags and coordinate ranges; skips invalid entries with a warning.
+        """
+        if not self.analyzer.load_and_validate():
+            if json_output:
+                print(json.dumps({"error": "Failed to load or validate font"}))
+            return
+
+        self.metadata = self.analyzer.analyze()
+        self.stat_parser = self.analyzer.stat_parser
+
+        axis_by_tag = {a.tag: a for a in self.metadata.axes}
+
+        generator = InstanceGenerator(
+            self.analyzer,
+            self.stat_parser,
+            self.config,
+            error_tracker=self.error_tracker,
+        )
+        self.last_generator = generator
+
+        generated_files: List[Dict] = []
+        skipped = 0
+
+        if not json_output:
+            cs.emit(
+                f"Generating {cs.fmt_count(len(instances_list))} instance(s) from JSON..."
+            )
+
+        for item in instances_list:
+            name = item.get("name")
+            coordinates = item.get("coordinates")
+            if not name or coordinates is None:
+                skipped += 1
+                if not json_output:
+                    cs.emit(
+                        f"  [skip] Missing 'name' or 'coordinates': {item}",
+                        style="dim",
+                    )
+                continue
+
+            if not isinstance(coordinates, dict):
+                skipped += 1
+                if not json_output:
+                    cs.emit(
+                        f"  [skip] Invalid coordinates for '{name}': expected dict",
+                        style="dim",
+                    )
+                continue
+
+            # Validate: all axis tags exist and values in range
+            valid = True
+            for tag, val in coordinates.items():
+                if tag not in axis_by_tag:
+                    if not json_output:
+                        cs.emit(
+                            f"  [skip] '{name}': axis '{tag}' not in font",
+                            style="dim",
+                        )
+                    valid = False
+                    break
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    if not json_output:
+                        cs.emit(
+                            f"  [skip] '{name}': non-numeric value for {tag}",
+                            style="dim",
+                        )
+                    valid = False
+                    break
+                if not axis_by_tag[tag].is_in_range(v):
+                    if not json_output:
+                        cs.emit(
+                            f"  [skip] '{name}': {tag}={val} outside range "
+                            f"{axis_by_tag[tag].min_value}–{axis_by_tag[tag].max_value}",
+                            style="dim",
+                        )
+                    valid = False
+                    break
+
+            if not valid:
+                skipped += 1
+                continue
+
+            # Ensure all variable axes have a value (fill defaults for missing)
+            coords = dict(coordinates)
+            for axis in self.metadata.axes:
+                if axis.is_variable() and axis.tag not in coords:
+                    coords[axis.tag] = axis.default_value
+
+            output_path = generator.generate_instance(coords, name)
+            if output_path:
+                filename = Path(output_path).name
+                if json_output:
+                    generated_files.append({
+                        "name": name,
+                        "filename": filename,
+                        "path": output_path,
+                        "coordinates": coords,
+                    })
+                else:
+                    cs.emit(f"  Generated: {filename}")
+
+        if json_output:
+            output = {
+                "success": generator.successful_count > 0,
+                "generated_count": generator.successful_count,
+                "skipped": skipped,
+                "total_requested": len(instances_list),
+                "files": generated_files,
+                "output_dir": str(
+                    self.config.output_dir or Path(self.font_path).parent
+                ),
+            }
+            print(json.dumps(output, indent=2))
+        elif generator.successful_count > 0 or skipped > 0:
+            output_dir = self.config.output_dir or Path(self.font_path).parent
+            cs.emit("")
+            StatusIndicator("success", dry_run=self.config.dry_run).add_message(
+                f"Generated {cs.fmt_count(generator.successful_count)} instance(s)"
+            ).add_item(f"Skipped: {cs.fmt_count(skipped)}").add_item(
+                f"Output: {cs.fmt_file_compact(str(output_dir))}"
+            ).emit()
+
 
 # ============================================================================
 # CLI Entry Point
@@ -2227,6 +2357,9 @@ Batch Processing
       
   %(prog)s fonts/ -r -y
       Process directory recursively
+      
+  %(prog)s fonts/ -jb gd-foundry-styles.json
+      Generate instances from JSON (font basename → instance list); implies -y
 
 Naming Strategy Options
 ───────────────────────
@@ -2386,6 +2519,14 @@ fvar-raw Names (-r)
         action="store_true",
         help="Output results as JSON (for app integration)",
     )
+    parser.add_argument(
+        "-jb",
+        "--json-batch",
+        type=str,
+        metavar="FILE",
+        default=None,
+        help="JSON file mapping font basenames to instance lists (name + coordinates); implies -y",
+    )
 
     args = parser.parse_args()
     
@@ -2478,6 +2619,31 @@ fvar-raw Names (-r)
     if not font_files:
         StatusIndicator("error").add_message("No font files found to process").emit()
         return 1
+
+    # Load JSON batch mapping if --json-batch provided
+    json_batch_data: Optional[Dict[str, List[Dict]]] = None
+    if args.json_batch:
+        jb_path = Path(args.json_batch)
+        if not jb_path.exists():
+            StatusIndicator("error").add_message("JSON batch file not found").add_file(
+                args.json_batch, filename_only=False
+            ).emit()
+            return 1
+        try:
+            with open(jb_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                StatusIndicator("error").add_message(
+                    "JSON batch file must be an object (font basename → instance list)"
+                ).emit()
+                return 1
+            json_batch_data = raw
+            args.yes = True  # No prompts when using JSON batch
+        except json.JSONDecodeError as e:
+            StatusIndicator("error").add_message("Invalid JSON in batch file").with_explanation(
+                str(e)
+            ).emit()
+            return 1
 
     # Determine naming strategy from flags (default)
     if args.fvar_hybrid:
@@ -2579,7 +2745,18 @@ fvar-raw Names (-r)
             processor = FontProcessor(font_path, config, error_tracker=error_tracker)
 
             try:
-                if args.yes:
+                basename = Path(font_path).name
+                if json_batch_data is not None and basename in json_batch_data:
+                    processor.run_instances_json_mode(
+                        json_batch_data[basename], json_output=args.json
+                    )
+                    if (
+                        processor.last_generator
+                        and processor.last_generator.successful_count > 0
+                    ):
+                        total_instances += processor.last_generator.successful_count
+                        successful_fonts += 1
+                elif args.yes:
                     # Parse instance indices if --instance specified
                     instance_indices = None
                     if args.instance:
