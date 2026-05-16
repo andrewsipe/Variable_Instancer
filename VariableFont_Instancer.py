@@ -26,6 +26,8 @@ Usage:
   python script.py fontfile.ttf --info       # View font information
   python script.py fontfile.ttf --auto --naming stat    # Auto-generate (STAT)
   python script.py fontfile.ttf --auto --naming fvar    # Auto-generate (fvar hybrid)
+  python script.py fontfile.ttf -y   # Skips duplicate-coordinate fvar rows by default
+  python script.py fontfile.ttf -y --all-fvar-instance-rows   # Emit every fvar row
 """
 
 import argparse
@@ -35,7 +37,7 @@ import sys
 from pathlib import Path
 from fontTools.ttLib import TTFont
 from fontTools.varLib import instancer
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Union, Literal
 from dataclasses import dataclass, asdict
 from enum import Enum
 
@@ -63,6 +65,88 @@ from FontCore.core_console_styles import StatusIndicator
 logger = cs.get_logger(__name__)
 console = cs.get_console()
 RICH_AVAILABLE = cs.RICH_AVAILABLE
+
+
+def _emit_dim(text: str) -> None:
+    """Dim line via Rich markup (cs.emit has no style= kwarg)."""
+    if RICH_AVAILABLE:
+        from rich.markup import escape
+
+        cs.emit(f"[dim]{escape(text)}[/dim]")
+    else:
+        cs.emit(text)
+
+
+def _emit_menu(text: str) -> None:
+    """Menu / prompt line at normal contrast (readable on dark terminals)."""
+    if RICH_AVAILABLE:
+        from rich.markup import escape
+
+        cs.emit(escape(text))
+    else:
+        cs.emit(text)
+
+
+def _emit_menu_row(label: str, body: str, *, label_col: int = 16) -> None:
+    """One menu line: bold label, body starts at a fixed column (aligned)."""
+    pad_len = max(1, label_col - len(label))
+    pad = " " * pad_len
+    if RICH_AVAILABLE:
+        from rich.markup import escape
+
+        cs.emit(f"  [bold]{escape(label)}[/bold]{pad}{escape(body)}")
+    else:
+        cs.emit(f"  {label}{pad}{body}")
+
+
+def _raise_if_quit(line: str) -> None:
+    """Exit the process if the user entered q / quit (any prompt)."""
+    if line.strip().lower() in ("q", "quit"):
+        raise SystemExit(0)
+
+
+def _emit_bold(text: str) -> None:
+    if RICH_AVAILABLE:
+        from rich.markup import escape
+
+        cs.emit(f"[bold]{escape(text)}[/bold]")
+    else:
+        cs.emit(text)
+
+
+_COORD_CANONICAL_ORDER = ["wdth", "wght", "slnt", "ital", "obli", "opsz"]
+
+
+def _coord_sort_key(item: Tuple[str, float]) -> Tuple[int, Union[int, str]]:
+    axis = item[0]
+    try:
+        return (0, _COORD_CANONICAL_ORDER.index(axis))
+    except ValueError:
+        return (1, axis)
+
+
+def _sorted_coord_items(coords: Dict[str, float]) -> List[Tuple[str, float]]:
+    return sorted(coords.items(), key=_coord_sort_key)
+
+
+def _format_coord_part(tag: str, value: float) -> str:
+    if value == int(value):
+        return f"{tag}={int(value)}"
+    return f"{tag}={value}"
+
+
+@dataclass
+class _PendingInstance:
+    """A queued custom instance not yet generated."""
+
+    coordinates: Dict[str, float]
+    name: str
+
+    def display(self) -> str:
+        coord_str = "  ".join(
+            _format_coord_part(k, v) for k, v in _sorted_coord_items(self.coordinates)
+        )
+        return f"{coord_str}   →  {self.name}"
 
 
 # ============================================================================
@@ -100,6 +184,98 @@ ITALIC_ANGLE_THRESHOLD = 0.1
 ITALIC_ANGLE_MIN = 0.01
 
 
+def instance_coordinate_key(
+    coordinates: Dict[str, float], epsilon: float = AXIS_VALUE_EPSILON
+) -> Tuple[Tuple[str, float], ...]:
+    """Stable fingerprint for comparing fvar instances by axis coordinates (not names)."""
+    if not coordinates:
+        return ()
+
+    def snap(v: float) -> float:
+        return round(v / epsilon) * epsilon
+
+    return tuple((tag, snap(float(val))) for tag, val in sorted(coordinates.items()))
+
+
+def count_coordinate_duplicate_rows(instances: List["InstanceInfo"]) -> int:
+    """How many instances would be skipped if keeping only first occurrence per coordinate key."""
+    if len(instances) < 2:
+        return 0
+    seen: set[Tuple[Tuple[str, float], ...]] = set()
+    dups = 0
+    for inst in instances:
+        key = instance_coordinate_key(inst.coordinates)
+        if key in seen:
+            dups += 1
+        else:
+            seen.add(key)
+    return dups
+
+
+def unique_instances_by_coordinates(
+    instances: List["InstanceInfo"],
+) -> Tuple[List["InstanceInfo"], int]:
+    """Drop later fvar instances whose snapped coordinates match an earlier row. Returns (unique, num_skipped)."""
+    seen: set[Tuple[Tuple[str, float], ...]] = set()
+    out: List["InstanceInfo"] = []
+    skipped = 0
+    for inst in instances:
+        key = instance_coordinate_key(inst.coordinates)
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        out.append(inst)
+    return out, skipped
+
+
+def coordinate_first_kept_instance_indices(
+    instances: List["InstanceInfo"],
+) -> set[int]:
+    """fvar instance indices (InstanceInfo.index) kept when deduping: first row per coordinate key."""
+    seen: set[Tuple[Tuple[str, float], ...]] = set()
+    kept: set[int] = set()
+    for inst in instances:
+        k = instance_coordinate_key(inst.coordinates)
+        if k not in seen:
+            kept.add(inst.index)
+            seen.add(k)
+    return kept
+
+
+def prior_duplicate_coordinate_slot_by_index(
+    instances: List["InstanceInfo"],
+) -> Dict[int, Optional[int]]:
+    """Map InstanceInfo.index -> earlier # column value (1-based) with same snapped coordinates.
+
+    First occurrence maps to None; later fvar rows map to that first slot number.
+    """
+    seen: Dict[Tuple[Tuple[str, float], ...], int] = {}
+    out: Dict[int, Optional[int]] = {}
+    for inst in sorted(instances, key=lambda i: i.index):
+        key = instance_coordinate_key(inst.coordinates)
+        slot = inst.index + 1
+        if key not in seen:
+            seen[key] = slot
+            out[inst.index] = None
+        else:
+            out[inst.index] = seen[key]
+    return out
+
+
+def instances_for_processing(
+    metadata: "FontMetadata", config: "InstancerConfig"
+) -> Tuple[List["InstanceInfo"], int]:
+    """
+    Instances to iterate for UI numbering and generation.
+    Returns (instances, duplicates_skipped) where duplicates_skipped is 0 unless dedupe is enabled.
+    """
+    if not config.skip_coordinate_duplicates:
+        return metadata.instances, 0
+    uniq, skipped = unique_instances_by_coordinates(metadata.instances)
+    return uniq, skipped
+
+
 @dataclass
 class InstancerConfig:
     """Configuration for instance processing."""
@@ -108,6 +284,7 @@ class InstancerConfig:
     keep_stat: bool = False
     naming_mode: NamingMode = NamingMode.STAT
     dry_run: bool = False
+    skip_coordinate_duplicates: bool = True
 
 
 # ============================================================================
@@ -838,9 +1015,88 @@ class InstanceNamingStrategy:
 class InteractivePrompt:
     """Handles user interaction and prompts."""
 
-    def __init__(self, metadata: FontMetadata, stat_parser: STATNameParser):
+    def __init__(
+        self,
+        metadata: FontMetadata,
+        stat_parser: STATNameParser,
+        selection_instances: Optional[List[InstanceInfo]] = None,
+        coordinate_dedupe_active: bool = False,
+    ):
         self.metadata = metadata
         self.stat_parser = stat_parser
+        self.selection_instances = selection_instances or metadata.instances
+        self.coordinate_dedupe_active = coordinate_dedupe_active
+        self._kept_coordinate_instance_indices = coordinate_first_kept_instance_indices(
+            metadata.instances
+        )
+
+    def _instance_for_table_slot(self, slot_number: int) -> Optional[InstanceInfo]:
+        """Resolve UI # column (fvar instance order label) to an InstanceInfo."""
+        for inst in self.metadata.instances:
+            if inst.index + 1 == slot_number:
+                return inst
+        return None
+
+    def _max_table_slot_number(self) -> int:
+        if not self.metadata.instances:
+            return 0
+        return max(inst.index + 1 for inst in self.metadata.instances)
+
+    def _default_naming_mode(self) -> NamingMode:
+        """fvar-hybrid when fvar names exist; STAT otherwise."""
+        has_fvar = any(
+            inst.fvar_name != UNKNOWN_FVAR_NAME for inst in self.metadata.instances
+        )
+        return NamingMode.FVAR_HYBRID if has_fvar else NamingMode.STAT
+
+    def _parse_numbers_only(
+        self, response: str
+    ) -> Optional[List[Tuple[int, NamingMode]]]:
+        """Parse space/comma-separated table slot numbers (# column). No DSL.
+
+        Returns (processing_list_index, STAT) tuples; mode is overwritten by caller.
+        None on invalid token or validation failure. Dedupes by index (first wins).
+        """
+        if not response.strip():
+            return []
+        normalized = response.replace(",", " ")
+        tokens = [t for t in normalized.split() if t]
+        if not tokens:
+            return []
+        result: List[Tuple[int, NamingMode]] = []
+        seen_idx: set[int] = set()
+        mx = self._max_table_slot_number()
+
+        for token in tokens:
+            if not token.isdigit():
+                _emit_dim(
+                    f"  '{token}' is not a valid instance number (use digits only)."
+                )
+                return None
+            num = int(token)
+            inst_pick = self._instance_for_table_slot(num)
+            if inst_pick is None:
+                _emit_dim(f"  Instance #{num} is out of range (1–{mx})")
+                return None
+            if (
+                self.coordinate_dedupe_active
+                and inst_pick.index not in self._kept_coordinate_instance_indices
+            ):
+                _emit_dim(
+                    f"  #{num} matches an earlier coordinate set (purple row + gold #); "
+                    "skipped by default; use --all-fvar-instance-rows to generate it."
+                )
+                return None
+            try:
+                idx = self.selection_instances.index(inst_pick)
+            except ValueError:
+                _emit_dim(f"  #{num} could not be resolved for generation.")
+                return None
+            if idx not in seen_idx:
+                seen_idx.add(idx)
+                result.append((idx, NamingMode.STAT))
+
+        return result
 
     def _classify_axes(self) -> Tuple[List[AxisInfo], List[AxisInfo]]:
         """Separate axes into variable and fixed."""
@@ -897,70 +1153,175 @@ class InteractivePrompt:
 
     def show_instance_selection(
         self,
-    ) -> Optional[Tuple[List[Tuple[int, NamingMode]], NamingMode]]:
-        """Show instances and get user selection."""
-        self._print_header("Named Instances")
+    ) -> Optional[Union[Literal["custom"], Tuple[List[Tuple[int, NamingMode]], NamingMode]]]:
+        """Show instance table then a grouped three-row action menu.
 
-        # Check if any instances have fvar names (show column if they exist)
+        Layout (always):
+            [table]
+            Legend: … (only relevant parts)
+
+            Generate all    [Enter] …   [s] STAT   …     (label bold)
+            Pick subset     type slot numbers, e.g. 1 3 7   (label bold)
+            Other           [c] … [a] … [?] …            (label bold)
+
+        Returns:
+            None                                        — skip this font ([w] or skip)
+            "custom"                                    — route to custom mode
+            ([], mode)                                  — generate all with mode
+            ([(processing_idx, mode), …], mode)         — generate specific instances
+        Raises:
+            SystemExit(0) when the user chooses quit.
+        """
         has_fvar_names = any(
             inst.fvar_name != UNKNOWN_FVAR_NAME for inst in self.metadata.instances
         )
+        default_mode = self._default_naming_mode()
 
-        # Print table with naming comparison
-        self._print_instances_table_with_naming(has_fvar_names)
+        while True:
+            self._print_header("Named Instances")
+            any_names_differ, has_dup_coords = self._print_instances_table_with_naming(
+                show_naming_comparison=has_fvar_names,
+                show_legend_banners=False,
+            )
 
-        # Show simplified options
-        print("\n" + "─" * 70)
-        print("GENERATION OPTIONS")
-        print("─" * 70)
+            # Compact legend — one line, only what applies to this font
+            self._print_table_legend(any_names_differ, has_dup_coords, has_fvar_names)
 
-        if has_fvar_names:
-            StatusIndicator("info").add_message(
-                "This font has fvar names available for comparison"
-            ).emit()
-            print("  • STAT names:   derived from STAT table (canonical, recommended)")
-            print("  • fvar names:   from fvar instance records (legacy)")
-            print("  • fvar-hybrid:  fvar names + auto-add 'Regular' when appropriate")
-            print()
+            # --- Grouped three-row action menu ---
+            cs.emit("")
 
-        print("Generate all instances:")
-        print("  [Enter]      STAT names (default)")
-        if has_fvar_names:
-            print("  [fvar]       fvar-hybrid names")
-            print("  [raw]        fvar names (no modifications)")
+            if has_fvar_names:
+                if default_mode == NamingMode.FVAR_HYBRID:
+                    gen_line = "[Enter] fvar-hybrid   [s] STAT   [r] raw"
+                else:
+                    gen_line = "[Enter] STAT   [f] fvar-hybrid   [r] raw"
+            else:
+                gen_line = "[Enter] STAT"
 
-        print("\nGenerate specific instances:")
-        print("  [1,2,3]      Instance numbers (comma or space separated)")
-        if has_fvar_names:
-            print("  [stat:1,2]   Specific instances with naming mode")
-            print("  [1s 2f]      Per-instance mode (s=stat, f=fvar, r=raw)")
+            _emit_menu_row("Generate all", gen_line)
+            _emit_menu_row(
+                "Pick subset",
+                "type slot numbers, e.g.  1  3  7",
+            )
+            _emit_menu_row(
+                "Other",
+                "[c] custom   [a] advanced   [?] help   [w] skip font   [q] quit",
+            )
 
-        print("\n  [i]          Show table again")
-        print("  [s]          Skip this font")
-        print("  [q]          Quit program")
-        print("─" * 70)
+            response = input("  > ").strip().lower()
 
-        response = input("\nYour choice: ").strip().lower()
-
-        if response in ("q", "quit"):
-            # Exit entire program
-            raise SystemExit(0)
-        elif response in ("s", "skip"):
-            # Skip to next font
-            return None
-        elif response == "i":
-            return self.show_instance_selection()  # Recursive call
-        elif response in ("stat", ""):
-            return ([], NamingMode.STAT)
-        elif response in ("f", "fvar"):
-            return ([], NamingMode.FVAR_HYBRID)
-        elif response in ("fn", "raw"):
-            return ([], NamingMode.FVAR_RAW)
-        else:
-            instances = self._parse_instance_selection(response, has_fvar_names)
-            if instances is None:
+            # --- Navigation / escape ---
+            if response in ("q", "quit"):
+                raise SystemExit(0)
+            rsp0 = response.split()[0] if response else ""
+            if rsp0 in ("w", "skip"):
                 return None
-            return (instances, NamingMode.STAT)
+            if response in ("?", "help"):
+                self._show_help_panel(has_fvar_names, default_mode)
+                continue  # redraw table + menu
+            if response == "c":
+                return "custom"
+
+            # --- Advanced DSL (per-slot naming) ---
+            if response in ("a", "advanced"):
+                cs.emit("")
+                _emit_menu("  Advanced — per-slot naming")
+                _emit_menu(
+                    "    Suffix each slot:  s=STAT   r=raw   f=fvar-hybrid     "
+                    "(e.g. 1s 2r 3f)"
+                )
+                _emit_menu(
+                    "    Or:  stat:1,2 fvar:3     s1 r2 f3     "
+                    "[m] return to table   [q] quit"
+                )
+                adv = input("  > ").strip()
+                _raise_if_quit(adv)
+                adv_key = adv.strip().lower().split()[0] if adv.strip() else ""
+                if not adv_key or adv_key in ("m", "main", "menu"):
+                    continue
+                parsed = self._parse_instance_selection(adv, has_fvar_names)
+                if parsed is None:
+                    cs.emit("")
+                    _emit_menu(
+                        "    Invalid. Try: 1s 2r 3f  or  stat:1,2   "
+                        "[m] return to table   [q] quit"
+                    )
+                    adv2 = input("  > ").strip()
+                    _raise_if_quit(adv2)
+                    adv2_key = adv2.strip().lower().split()[0] if adv2.strip() else ""
+                    if not adv2_key or adv2_key in ("m", "main", "menu"):
+                        continue
+                    parsed = self._parse_instance_selection(adv2, has_fvar_names)
+                    if parsed is None:
+                        StatusIndicator("warning").add_message(
+                            "Could not parse advanced selection. Skipping font."
+                        ).emit()
+                        return None
+                adv_mode = parsed[0][1] if parsed else default_mode
+                return (parsed, adv_mode)
+
+            # --- Generate-all shortcut keys ---
+            if has_fvar_names:
+                if response in ("s", "stat"):
+                    return ([], NamingMode.STAT)
+                if response in ("f", "fvar"):
+                    return ([], NamingMode.FVAR_HYBRID)
+                if response in ("r", "raw", "fn"):
+                    return ([], NamingMode.FVAR_RAW)
+
+            if response == "":
+                return ([], default_mode)
+
+            # --- Slot-number picker ---
+            indices = self._parse_numbers_only(response)
+            if indices is None:
+                cs.emit("")
+                _emit_menu(
+                    "    Enter slot numbers (e.g. 1 3 7), a mode key, or [?] for help."
+                )
+                response2 = input("  > ").strip().lower()
+                if response2 in ("q", "quit"):
+                    raise SystemExit(0)
+                r20 = response2.split()[0] if response2 else ""
+                if r20 in ("w", "skip"):
+                    return None
+                if response2 == "":
+                    continue
+                if response2 in ("?", "help"):
+                    self._show_help_panel(has_fvar_names, default_mode)
+                    continue
+                indices = self._parse_numbers_only(response2)
+                if indices is None:
+                    StatusIndicator("warning").add_message(
+                        "Could not parse selection. Skipping font."
+                    ).emit()
+                    return None
+
+            if not indices:
+                return None
+
+            # Naming mode follow-up (only when font has fvar names)
+            mode = default_mode
+            if has_fvar_names:
+                if default_mode == NamingMode.FVAR_HYBRID:
+                    naming_prompt = "[Enter] fvar-hybrid   [s] STAT   [r] raw"
+                else:
+                    naming_prompt = "[Enter] STAT   [f] fvar-hybrid   [r] raw"
+                cs.emit("")
+                _emit_menu("  Naming (applies to selected instances)")
+                _emit_menu(f"    {naming_prompt}   [q] quit")
+                naming_response = input("  > ").strip().lower()
+                _raise_if_quit(naming_response)
+                if naming_response in ("s", "stat"):
+                    mode = NamingMode.STAT
+                elif naming_response in ("f", "fvar"):
+                    mode = NamingMode.FVAR_HYBRID
+                elif naming_response in ("r", "raw", "fn"):
+                    mode = NamingMode.FVAR_RAW
+                # else: keep default_mode (Enter)
+
+            indices_with_mode = [(idx, mode) for idx, _ in indices]
+            return (indices_with_mode, mode)
 
     def _build_hybrid_name_for_display(self, inst: InstanceInfo) -> str:
         """Build hybrid name for display with bold for added words."""
@@ -1014,11 +1375,33 @@ class InteractivePrompt:
 
         return normalized_fvar if normalized_fvar != UNKNOWN_FVAR_NAME else "N/A"
 
-    def _print_instances_table_with_naming(self, show_naming_comparison: bool) -> None:
-        """Print instances table with optional naming comparison."""
-        if not self.metadata.instances:
+    def _print_instances_table_with_naming(
+        self,
+        show_naming_comparison: bool,
+        show_legend_banners: bool = True,
+    ) -> Tuple[bool, bool]:
+        """Print instances table with optional naming comparison.
+
+        Args:
+            show_naming_comparison: Include the fvar Name column.
+            show_legend_banners:    When True (default, used by info mode) fire the
+                                    verbose StatusIndicator banners after the table.
+                                    Pass False in selection mode to use the compact
+                                    one-line legend instead.
+
+        Returns:
+            (any_names_differ, has_dup_coords) so the caller can build a legend.
+        """
+        rows = self.metadata.instances
+        if not rows:
             cs.emit("\nNo named instances found")
-            return
+            return (False, False)
+
+        dup_coord_count = count_coordinate_duplicate_rows(self.metadata.instances)
+        prior_duplicate_slot = prior_duplicate_coordinate_slot_by_index(rows)
+        has_dup_coords = dup_coord_count > 0
+        dup_row_bg = "on #4b3652"
+        any_names_differ = False
 
         table = cs.create_table(
             show_header=True, row_styles=["on #282a39", "on #1d1f30"]
@@ -1026,7 +1409,7 @@ class InteractivePrompt:
         if table:
             # Set table width to match console width
             table.width = console.size.width
-            table.add_column("#", style="dim")
+            table.add_column("#", style="dim", overflow="fold", no_wrap=False)
             table.add_column("STAT Name", style="pale_green1")
 
             if show_naming_comparison:
@@ -1035,8 +1418,10 @@ class InteractivePrompt:
             table.add_column("Style", style="medium_turquoise")
             table.add_column("Coordinates", style="turquoise2")
 
-            for inst in self.metadata.instances:
+            for inst in rows:
                 ribbi = self._get_ribbi_label(inst)
+                prior_same = prior_duplicate_slot.get(inst.index)
+                coord_dup_row = prior_same is not None
 
                 # Check if names differ (compare normalized versions)
                 normalized_fvar = (
@@ -1053,57 +1438,271 @@ class InteractivePrompt:
                     normalized_fvar != inst.stat_name
                     and normalized_fvar != UNKNOWN_FVAR_NAME
                 )
+                if names_differ:
+                    any_names_differ = True
 
-                # Apply highlighting to cells when names differ
-                if names_differ and RICH_AVAILABLE:
-                    # Yellow background for different names
+                # Apply highlighting when names differ; skip when row repeats coordinates
+                if names_differ and RICH_AVAILABLE and not coord_dup_row:
                     stat_display = (
                         f"[#282a39 on #ffdf80]{inst.stat_name}[/#282a39 on #ffdf80]"
                     )
-                    hybrid_display = f"[#282a39 on #ffdf80]{self._build_hybrid_name_for_display(inst)}[/#282a39 on #ffdf80]"
+                    hybrid_display = (
+                        f"[#282a39 on #ffdf80]"
+                        f"{self._build_hybrid_name_for_display(inst)}"
+                        f"[/#282a39 on #ffdf80]"
+                    )
                 else:
-                    # Normal display
                     stat_display = inst.stat_name
                     hybrid_display = self._build_hybrid_name_for_display(inst)
 
-                row_data = [str(inst.index + 1), stat_display]
+                # # column: ◆ for duplicate-coord rows, ■ for name-differ rows.
+                # Icons are the same markers used in the compact legend below
+                # the table, giving the user a direct visual link.
+                if RICH_AVAILABLE:
+                    if coord_dup_row:
+                        num_cell = f"[bold #fecf82]◆ {inst.index + 1}[/bold #fecf82]"
+                    elif names_differ and show_naming_comparison:
+                        num_cell = f"[#ffdf80]■ {inst.index + 1}[/#ffdf80]"
+                    else:
+                        num_cell = str(inst.index + 1)
+                else:
+                    if coord_dup_row:
+                        num_cell = f"◆ {inst.index + 1}"
+                    elif names_differ and show_naming_comparison:
+                        num_cell = f"■ {inst.index + 1}"
+                    else:
+                        num_cell = str(inst.index + 1)
+
+                row_data = [num_cell, stat_display]
 
                 if show_naming_comparison:
                     row_data.append(hybrid_display)
 
                 row_data.extend([ribbi, inst.format_coordinates()])
-                table.add_row(*row_data)
+
+                if coord_dup_row:
+                    table.add_row(*row_data, style=dup_row_bg)
+                else:
+                    table.add_row(*row_data)
 
             console.print(table)
+        else:
+            # Fallback for non-Rich
+            cs.emit(f"\nInstances ({len(rows)}):")
+            for inst in rows:
+                ribbi = self._get_ribbi_label(inst)
+                prior_same = prior_duplicate_slot.get(inst.index)
+                coord_dup_row = prior_same is not None
 
-            # Add note about bold formatting if there are any hybrid modifications
-            if show_naming_comparison:
-                # Add legend explaining highlighting
+                normalized_fvar = (
+                    normalize_fvar_name(
+                        inst.fvar_name,
+                        stat_values=self.metadata.stat_values,
+                        coordinates=inst.coordinates,
+                    )
+                    if inst.fvar_name != UNKNOWN_FVAR_NAME
+                    else UNKNOWN_FVAR_NAME
+                )
+                names_differ = (
+                    normalized_fvar != inst.stat_name
+                    and normalized_fvar != UNKNOWN_FVAR_NAME
+                )
+
+                prefix = "◆ " if coord_dup_row else ("■ " if names_differ and show_naming_comparison else "  ")
+                cs.emit(f"{prefix}{inst.index + 1:2}. {inst.stat_name:25} [{ribbi:12}]")
+                if show_naming_comparison and inst.fvar_name != UNKNOWN_FVAR_NAME:
+                    hybrid = self._build_hybrid_name_for_display(inst)
+                    cs.emit(f"      fvar: {hybrid}")
+                mark = "  [dup coords]" if coord_dup_row else ""
+                cs.emit(f"      {inst.format_coordinates()}{mark}")
+
+        # Verbose banners — used in info mode; suppressed in selection mode
+        # (selection mode uses the compact one-line legend instead).
+        if show_legend_banners:
+            if has_dup_coords:
+                cs.emit("")
+                if self.coordinate_dedupe_active:
+                    StatusIndicator("info").add_message(
+                        "[#fecf82 on #4b3652]◆ Purple-tinted rows[/#fecf82 on #4b3652]"
+                        " mark the same coordinates as an earlier row; "
+                        "those rows are omitted from generation by default "
+                        "(use --all-fvar-instance-rows to emit them)."
+                    ).emit()
+                else:
+                    StatusIndicator("info").add_message(
+                        "[#fecf82 on #4b3652]◆ Purple-tinted rows[/#fecf82 on #4b3652]"
+                        " are duplicate-coordinate rows. "
+                        "With --all-fvar-instance-rows they generate like any other when selected."
+                    ).emit()
+
+            if table and show_naming_comparison:
                 cs.emit("")
                 StatusIndicator("info").add_message(
-                    "[#282a39 on #ffdf80]Highlighted cells[/#282a39 on #ffdf80] indicate STAT and fvar names differ"
+                    "[#282a39 on #ffdf80]■ Highlighted cells[/#282a39 on #ffdf80]"
+                    " indicate STAT and fvar names differ"
                 ).emit()
 
                 has_modifications = any(
                     self._build_hybrid_name_for_display(inst) != inst.fvar_name
-                    for inst in self.metadata.instances
+                    for inst in rows
                     if inst.fvar_name != UNKNOWN_FVAR_NAME
                 )
                 if has_modifications:
                     cs.emit("")
                     StatusIndicator("info").add_message(
-                        "[bold]Bold[/bold] words in fvar names indicate hybrid additions (use [raw] to omit)"
+                        "[bold]Bold[/bold] words in fvar names indicate"
+                        " hybrid additions (use [raw] to omit)"
                     ).emit()
+
+        return (any_names_differ, has_dup_coords)
+
+    def _print_table_legend(
+        self,
+        has_name_diffs: bool,
+        has_dup_coords: bool,
+        show_naming_comparison: bool,
+    ) -> None:
+        """Single compact legend line between the table and the action menu.
+
+        Only emits parts that are relevant to the current font — no legend
+        is shown when neither condition applies.  The ■ / ◆ icons match the
+        markers already present in the # column of the table above.
+        """
+        parts: List[str] = []
+
+        if has_name_diffs and show_naming_comparison:
+            if RICH_AVAILABLE:
+                parts.append(
+                    "[#ffdf80]■[/#ffdf80] "
+                    "[#282a39 on #ffdf80] Yellow [/#282a39 on #ffdf80]"
+                    " STAT/fvar names differ"
+                )
+            else:
+                parts.append("■ Yellow = STAT/fvar names differ")
+
+        if has_dup_coords:
+            if RICH_AVAILABLE:
+                parts.append(
+                    "[#fecf82]◆[/#fecf82] "
+                    "[#fecf82 on #4b3652] Purple [/#fecf82 on #4b3652]"
+                    " duplicate coordinates (skipped)"
+                )
+            else:
+                parts.append("◆ Purple = duplicate coordinates (skipped)")
+
+        if not parts:
+            return
+
+        separator = "     "
+        if RICH_AVAILABLE:
+            cs.emit(f"[dim]  Legend:  [/dim]" + separator.join(parts))
         else:
-            # Fallback for non-Rich
-            cs.emit(f"\nInstances ({len(self.metadata.instances)}):")
-            for inst in self.metadata.instances:
-                ribbi = self._get_ribbi_label(inst)
-                cs.emit(f"  {inst.index + 1:2}. {inst.stat_name:25} [{ribbi:12}]")
-                if show_naming_comparison and inst.fvar_name != UNKNOWN_FVAR_NAME:
-                    hybrid = self._build_hybrid_name_for_display(inst)
-                    cs.emit(f"      fvar: {hybrid}")
-                cs.emit(f"      {inst.format_coordinates()}")
+            cs.emit("  Legend:  " + separator.join(parts))
+
+    def _show_help_panel(self, has_fvar_names: bool, default_mode: NamingMode) -> None:
+        """On-demand help panel — shown when the user types [?] at the action prompt.
+
+        Explains naming modes, how to use each action, and the table legend.
+        After displaying, control returns to the caller which will redraw the menu.
+        """
+        def _default_tag(mode: NamingMode) -> str:
+            return "  [dim](default for this font)[/dim]" if RICH_AVAILABLE else "  (default)"
+
+        if RICH_AVAILABLE:
+            from rich.panel import Panel
+
+            naming_section: List[str] = [
+                "[bold]NAMING MODES[/bold]",
+            ]
+            if has_fvar_names:
+                naming_section += [
+                    f"  [pale_green1]fvar-hybrid[/pale_green1]  "
+                    f"fvar instance names; adds \"Regular\" where needed for RIBBI"
+                    f"{_default_tag(NamingMode.FVAR_HYBRID) if default_mode == NamingMode.FVAR_HYBRID else ''}",
+                    f"  [pale_green1]STAT[/pale_green1]         "
+                    f"Names from STAT table axis values (canonical)"
+                    f"{_default_tag(NamingMode.STAT) if default_mode == NamingMode.STAT else ''}",
+                    f"  [pale_green1]raw[/pale_green1]          "
+                    f"fvar names exactly as stored, no normalization",
+                ]
+            else:
+                naming_section += [
+                    f"  [pale_green1]STAT[/pale_green1]  "
+                    f"Names from STAT table axis values (canonical)"
+                    f"{_default_tag(NamingMode.STAT)}",
+                    "  [dim]fvar-hybrid and raw are unavailable — this font has no fvar instance names.[/dim]",
+                ]
+
+            actions_section: List[str] = [
+                "",
+                "[bold]GENERATE ALL[/bold]   [dim]Enter · s · f · r[/dim]",
+                "  All instances shown in the table, with the chosen naming mode.",
+                "",
+                "[bold]PICK SUBSET[/bold]   [dim]type slot numbers[/dim]",
+                "  Enter [turquoise2]#[/turquoise2] column values, space or comma separated —"
+                "  e.g. [turquoise2]1 3 7[/turquoise2]",
+                "  Naming mode is asked as a follow-up.",
+                "",
+                "[bold]ADVANCED[/bold]   [dim]a[/dim]",
+                "  Per-instance naming mode: [turquoise2]1s 2f 3r[/turquoise2]"
+                "   or   [turquoise2]stat:1,2 fvar:3[/turquoise2]",
+                "  Useful when different instances need different naming modes.",
+                "  [dim]Empty line or[/dim] [turquoise2]m[/turquoise2] [dim]returns to the table.[/dim]",
+                "",
+                "[bold]CUSTOM[/bold]   [dim]c[/dim]",
+                "  [turquoise2]n[/turquoise2] new instance, [turquoise2]f[/turquoise2] copy a table # row "
+                "then tweak axes, [turquoise2]g[/turquoise2] generate all pending, "
+                "[turquoise2]m[/turquoise2] return to named-instance menu.",
+                "",
+                "[bold]SKIP FONT[/bold]   [dim]w[/dim]",
+                "  At the instance table menu: skip this file (batch) or leave without generating.",
+            ]
+
+            legend_section: List[str] = [
+                "",
+                "[bold]TABLE LEGEND[/bold]",
+                "  [#ffdf80]■[/#ffdf80]  Yellow cells — STAT and fvar names differ for this instance",
+                "  [#fecf82]◆[/#fecf82]  Purple rows  — Same coordinates as an earlier row;",
+                "             skipped by default (--all-fvar-instance-rows to include all)",
+                "  [bold]Bold[/bold] text  — \"Regular\" was added by fvar-hybrid normalization",
+            ]
+
+            content = "\n".join(naming_section + actions_section + legend_section)
+            panel = Panel(
+                content,
+                title="[bold dodger_blue1] Help [/bold dodger_blue1]",
+                border_style="dodger_blue1",
+                padding=(1, 2),
+            )
+            console.print()
+            console.print(panel)
+            console.print()
+
+        else:
+            # Plain-text fallback
+            cs.emit("\n=== HELP ===")
+            cs.emit("NAMING MODES")
+            if has_fvar_names:
+                dflt = default_mode.value
+                cs.emit(f"  fvar-hybrid  fvar names; adds Regular for RIBBI{' (default)' if dflt == 'fvar-hybrid' else ''}")
+                cs.emit(f"  STAT         Names from STAT table axis values{' (default)' if dflt == 'stat' else ''}")
+                cs.emit("  raw          fvar names exactly as stored")
+            else:
+                cs.emit("  STAT  Names from STAT table axis values (default)")
+            cs.emit("")
+            cs.emit("ACTIONS")
+            cs.emit("  Enter (or s/f/r)  Generate all instances with chosen mode")
+            cs.emit("  1 3 7             Pick specific instances by # column")
+            cs.emit("  a                 Advanced: per-instance naming (m = return to table)")
+            cs.emit("  c                 Custom builder (see help)")
+            cs.emit("  w / skip          Skip this font")
+            cs.emit("  q                 Quit program")
+            cs.emit("")
+            cs.emit("TABLE LEGEND")
+            cs.emit("  ■  Yellow = STAT/fvar names differ")
+            cs.emit("  ◆  Purple = duplicate coordinates (skipped by default)")
+            cs.emit("  Bold text = Regular added by fvar-hybrid normalization")
+            cs.emit("============\n")
 
     def _parse_instance_selection(
         self, response: str, allow_naming: bool
@@ -1132,7 +1731,10 @@ class InteractivePrompt:
             allow_naming: If False, ignores naming mode specs and uses STAT for all
 
         Returns:
-            List of (instance_index, naming_mode) tuples, or None if parsing fails
+            List of (processing_list_index, naming_mode) tuples, or None if parsing fails.
+            Numbers refer to the table `#` column (`InstanceInfo.index + 1`). With
+            default duplicate-coordinate skipping, visually marked duplicate rows
+            (purple band, gold slot #) are rejected unless --all-fvar-instance-rows is set.
         """
         # Normalize input
         normalized = response.replace(",", " ")
@@ -1157,7 +1759,9 @@ class InteractivePrompt:
                 elif mode_str in ("r", "raw", "fn"):
                     mode = NamingMode.FVAR_RAW
                 else:
-                    print(f"❌ Invalid mode '{mode_str}'. Use: stat, fvar, or raw")
+                    _emit_dim(
+                        f"  Invalid mode '{mode_str}'. Use: stat, fvar, or raw"
+                    )
                     return None
 
                 # Parse number(s)
@@ -1165,7 +1769,7 @@ class InteractivePrompt:
                     num = int(num_str)
                 else:
                     # Could support ranges here: "1-3" → [1, 2, 3]
-                    print(f"❌ Invalid number format '{num_str}'")
+                    _emit_dim(f"  Invalid number format '{num_str}'")
                     return None
 
             # Check for "numbermode" format (e.g., "1s", "2f", "3r")
@@ -1205,188 +1809,356 @@ class InteractivePrompt:
                 mode = current_mode
 
             else:
-                print(f"❌ Invalid input: '{token}'")
-                print("   Valid formats: 1,2,3  or  stat:1,2  or  1s 2f  or  s 1 2")
+                _emit_dim(f"  Invalid input: '{token}'")
+                _emit_dim(
+                    "  Valid formats: 1,2,3  or  stat:1,2  or  1s 2f  or  s 1 2"
+                )
                 return None
 
             # Add to results if we parsed a number
             if num is not None:
-                if 1 <= num <= len(self.metadata.instances):
-                    idx = num - 1
-                    final_mode = mode if allow_naming else NamingMode.STAT
-                    result.append((idx, final_mode))
-                else:
-                    print(
-                        f"❌ Instance number {num} out of range (1-{len(self.metadata.instances)})"
+                inst_pick = self._instance_for_table_slot(num)
+                if inst_pick is None:
+                    mx = self._max_table_slot_number()
+                    _emit_dim(f"  Instance number {num} out of range (1–{mx})")
+                    return None
+                if (
+                    self.coordinate_dedupe_active
+                    and inst_pick.index not in self._kept_coordinate_instance_indices
+                ):
+                    _emit_dim(
+                        f"  Slot #{num} repeats coordinates of an earlier row (purple row + "
+                        "gold # in the table). Skipped by default; use "
+                        "--all-fvar-instance-rows to include."
                     )
                     return None
+                try:
+                    idx = self.selection_instances.index(inst_pick)
+                except ValueError:
+                    _emit_dim(f"  Instance #{num} could not be resolved for generation.")
+                    return None
+
+                final_mode = mode if allow_naming else NamingMode.STAT
+                result.append((idx, final_mode))
 
         if not result:
-            print("❌ No valid instance numbers provided")
+            _emit_dim("  No valid instance numbers provided")
             return None
 
         return result
 
+    def _prompt_axis_values(
+        self,
+        variable_axes: List[AxisInfo],
+        base_coords: Optional[Dict[str, float]] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Walk each variable axis; Enter keeps value; b/back = previous axis; x = cancel."""
+        def _fmt(v: float) -> str:
+            if v == int(v):
+                return str(int(v))
+            return str(v)
+
+        _emit_dim(
+            "    Enter = keep  ·  b / back = previous axis  ·  x / skip = cancel"
+        )
+
+        coords: Dict[str, float] = {}
+        i = 0
+        while i < len(variable_axes):
+            axis = variable_axes[i]
+            fallback = (base_coords or {}).get(axis.tag, axis.default_value)
+            current = coords.get(axis.tag, fallback)
+            label = "currently" if base_coords else "default"
+
+            prompt = (
+                f"    {axis.tag:6}  [{_fmt(axis.min_value)}–{_fmt(axis.max_value)}, "
+                f"{label} {_fmt(current)}] > "
+            )
+            while True:
+                raw = input(prompt).strip()
+                _raise_if_quit(raw)
+                low = raw.lower()
+                if low in ("x", "skip"):
+                    return None
+                if low in ("b", "back", "u", "undo"):
+                    if i == 0:
+                        _emit_dim(
+                            "      Already on the first axis — use x to cancel this instance."
+                        )
+                        continue
+                    prev = variable_axes[i - 1]
+                    coords.pop(prev.tag, None)
+                    i -= 1
+                    break
+                if raw == "":
+                    coords[axis.tag] = current
+                    i += 1
+                    break
+                try:
+                    val = float(raw)
+                except ValueError:
+                    _emit_dim(
+                        f"      Not a number. Range: {axis.min_value}–{axis.max_value}"
+                    )
+                    continue
+                if not axis.is_in_range(val):
+                    _emit_dim(
+                        f"      Out of range ({axis.min_value}–{axis.max_value})"
+                    )
+                    continue
+                coords[axis.tag] = val
+                i += 1
+                break
+        return coords
+
+    def _queue_one_custom_instance(
+        self,
+        queue: List[_PendingInstance],
+        font_path: str,
+        stat_parser: STATNameParser,
+        variable_axes: List[AxisInfo],
+        fixed_axes: List[AxisInfo],
+        base_coords: Optional[Dict[str, float]],
+    ) -> None:
+        """Prompt for coordinates + name and append to queue, or return if axes cancelled."""
+        while True:
+            coords = self._prompt_axis_values(variable_axes, base_coords)
+            if coords is None:
+                return
+
+            for ax in fixed_axes:
+                coords[ax.tag] = ax.min_value
+
+            stat_name = stat_parser.build_subfamily_name(coords, self.metadata)
+            has_non_stat = any(
+                tag in stat_parser.stat_values
+                and val not in stat_parser.stat_values[tag]
+                for tag, val in coords.items()
+            )
+            coord_preview = "  ".join(
+                _format_coord_part(k, v) for k, v in _sorted_coord_items(coords)
+            )
+            cs.emit(f"\n  → {coord_preview}")
+            if RICH_AVAILABLE:
+                from rich.markup import escape
+
+                hint = (
+                    "  [dim](between STAT values)[/dim]" if has_non_stat else ""
+                )
+                cs.emit(
+                    f"  → STAT name: [pale_green1]{escape(str(stat_name))}[/pale_green1]"
+                    + hint
+                )
+            else:
+                cs.emit(
+                    f"  → STAT name: {stat_name}"
+                    + ("  (between STAT values)" if has_non_stat else "")
+                )
+
+            name_raw = input(
+                "  Name [Enter=STAT   t=custom   b=re-edit axes] > "
+            ).strip()
+            _raise_if_quit(name_raw)
+            nk = name_raw.lower()
+            if nk in ("b", "back", "u", "undo"):
+                continue
+            if nk == "t":
+                typed = input("  Custom name > ").strip()
+                _raise_if_quit(typed)
+                final_name = typed if typed else stat_name
+            elif name_raw == "":
+                final_name = stat_name
+            else:
+                final_name = name_raw
+
+            try:
+                temp_font = TTFont(font_path)
+                family_name = (
+                    temp_font["name"].getDebugName(1)
+                    or temp_font["name"].getDebugName(16)
+                    or UNKNOWN_FVAR_NAME
+                )
+                family_name = strip_variable_tokens(family_name) or family_name
+                temp_font.close()
+            except Exception:
+                family_name = Path(font_path).stem.split("-")[0]
+
+            _emit_dim(
+                f"  Filename: {family_name}-{final_name.replace(' ', '')}",
+            )
+
+            queue.append(_PendingInstance(coordinates=dict(coords), name=final_name))
+            _emit_dim(
+                f"  Added to queue ({len(queue)} pending). [g] generate all pending, "
+                "[n] new instance, [m] main menu."
+            )
+            return
+
+    def _emit_instance_rows_for_custom_copy(self) -> None:
+        """Numbered fvar rows so standalone custom mode can use [f] without the big table."""
+        if not self.metadata.instances:
+            return
+        cs.emit("")
+        cs.emit("  # — coordinates — name   (for [f]: type # to copy that row, then edit)")
+        for inst in self.metadata.instances:
+            coord = "  ".join(
+                _format_coord_part(k, v)
+                for k, v in _sorted_coord_items(inst.coordinates)
+            )
+            label = inst.stat_name or inst.fvar_name
+            cs.emit(f"    {inst.index + 1:>3}  {coord}  ({label})")
+
     def show_custom_mode(
         self, font_path: str, axes: List[AxisInfo], stat_parser: STATNameParser
-    ) -> Optional[Tuple[Dict[str, float], str]]:
-        """Interactive custom coordinate builder."""
-        self._print_header("Custom Instance Builder")
-        self._print_axes_table()
-
+    ) -> List[Tuple[Dict[str, float], str]]:
+        """Queue-based custom builder; returns batches to generate (empty = exit)."""
+        _ = axes  # signature compatibility; axes come from self._classify_axes()
         variable_axes, fixed_axes = self._classify_axes()
 
         if not variable_axes:
+            self._print_header("Custom Instance Builder")
+            self._print_axes_table()
             StatusIndicator("warning").add_message(
-                "This font has no variable axes. All coordinates are fixed."
+                "This font has no variable axes — all coordinates are fixed."
             ).emit()
-            cs.emit("Cannot create custom instances.")
             input("\nPress Enter to continue...")
-            return None
+            return []
 
-        # Initialize coordinates with all fixed values
-        coordinates = {}
-        for axis in fixed_axes:
-            coordinates[axis.tag] = axis.min_value
+        queue: List[_PendingInstance] = []
+        listed_copy_rows = False
 
-        # Prompt only for variable axes
-        cs.emit("\nEnter coordinates for variable axes (press Enter for default):")
+        while True:
+            self._print_header("Custom Instance Builder")
+            self._print_axes_table()
+            if not listed_copy_rows and self.metadata.instances:
+                listed_copy_rows = True
+                self._emit_instance_rows_for_custom_copy()
 
-        for axis in variable_axes:
-            while True:
-                # Format prompt with range and default
-                default_display = (
-                    f"{axis.default_value:.1f}"
-                    if axis.default_value == int(axis.default_value)
-                    else f"{axis.default_value}"
+            cs.emit("")
+            if queue:
+                noun = "instance" if len(queue) == 1 else "instances"
+                cs.emit(f"  Pending ({len(queue)} {noun}):")
+                for i, item in enumerate(queue, 1):
+                    cs.emit(f"    {i}.  {item.display()}")
+            else:
+                _emit_dim("  Pending (0 instances):  none yet")
+
+            cs.emit("")
+            _emit_menu(
+                "  [n] new instance   [f] copy table row, tweak axes   "
+                "[m] main menu   [q] quit"
+            )
+            if queue:
+                _emit_menu(
+                    "  [r] remove from queue   [g] generate all pending   "
+                    "[c] clear queue"
                 )
-                range_display = f"{axis.min_value:.0f}-{axis.max_value:.0f}"
-                prompt = f"  {axis.name} ({range_display}) [{default_display}] [b=back, s=skip, q=quit]: "
 
-                response = input(prompt).strip()
+            choice_line = input("  > ").strip()
+            _raise_if_quit(choice_line)
+            choice = choice_line.lower()
+            key = choice.split()[0] if choice else ""
 
-                if response.lower() == "b":
-                    # Go back to previous axis
-                    if len(coordinates) > 0:
-                        last_axis = list(coordinates.keys())[-1]
-                        del coordinates[last_axis]
-                        cs.emit("  Going back to previous axis...", style="dim")
-                        return None  # Signal to restart from previous axis
-                    else:
-                        cs.emit("  Already at first axis", style="dim")
+            if key in ("m", "main", "menu"):
+                return []
+
+            if key in ("g", "go", "generate"):
+                if queue:
+                    return [(p.coordinates, p.name) for p in queue]
+                _emit_dim(
+                    "  Nothing queued yet — [n] new instance or [f] copy table row."
+                )
+                continue
+
+            if key in ("c", "clear"):
+                if queue:
+                    queue.clear()
+                else:
+                    _emit_dim("  Queue is already empty.")
+                continue
+
+            if key in ("r", "remove"):
+                if not queue:
+                    _emit_dim("  Queue is empty — nothing to remove.")
                     continue
-
-                if response.lower() in ("q", "quit"):
-                    # Exit entire program
-                    raise SystemExit(0)
-
-                if response.lower() in ("s", "skip"):
-                    # Skip to next font
-                    return None
-
-                if response == "":
-                    coordinates[axis.tag] = axis.default_value
-                    break
-
+                raw = input(f"  Remove from queue — # (1–{len(queue)}) > ").strip()
+                _raise_if_quit(raw)
                 try:
-                    value = float(response)
-                    if axis.is_in_range(value):
-                        coordinates[axis.tag] = value
-                        break
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(queue):
+                        removed = queue.pop(idx)
+                        _emit_dim(f"  Removed: {removed.name}")
                     else:
-                        cs.emit(
-                            f"{cs.indent(2)}Value must be between {axis.min_value} and {axis.max_value}"
-                        )
+                        _emit_dim("  Out of range")
                 except ValueError:
-                    cs.emit(f"{cs.indent(2)}Invalid number")
+                    _emit_dim("  Invalid number")
+                continue
 
-        # Sort coordinates in canonical order: wdth, wght, slnt/ital
-        canonical_order = ["wdth", "wght", "slnt", "ital", "obli"]
-        sorted_coords = []
-        for tag in canonical_order:
-            if tag in coordinates:
-                sorted_coords.append((tag, coordinates[tag]))
-        # Add any remaining axes not in canonical order
-        for tag, val in coordinates.items():
-            if tag not in canonical_order:
-                sorted_coords.append((tag, val))
-
-        # Build preview
-        cs.emit("\nBuilding instance with:")
-        coord_str = ", ".join([f"{k}={v}" for k, v in sorted_coords])
-        cs.emit(f"{cs.indent(1)}{coord_str}")
-
-        stat_name = stat_parser.build_subfamily_name(coordinates, self.metadata)
-        cs.emit(f"{cs.indent(1)}STAT name: {stat_name}")
-
-        if fixed_axes:
-            fixed_str = ", ".join(
-                [f"{axis.tag}={axis.min_value}" for axis in fixed_axes]
-            )
-            cs.emit(f"{cs.indent(1)}Fixed values: {fixed_str}")
-
-        # Extract family name from font file
-        try:
-            from fontTools.ttLib import TTFont
-
-            temp_font = TTFont(font_path)
-            family_name = (
-                temp_font["name"].getDebugName(1)
-                or temp_font["name"].getDebugName(16)
-                or UNKNOWN_FVAR_NAME
-            )
-            # Strip variable font suffixes
-            from FontCore.core_name_policies import strip_variable_tokens
-
-            family_name = strip_variable_tokens(family_name) or family_name
-            temp_font.close()
-        except Exception:
-            # Fallback to filename
-            family_name = Path(font_path).stem.split("-")[0]
-
-        # Determine if we need custom naming (non-STAT values)
-        has_non_stat_values = False
-        for tag, val in coordinates.items():
-            if tag in stat_parser.stat_values:
-                # Check if this value exists in STAT
-                if val not in stat_parser.stat_values[tag]:
-                    has_non_stat_values = True
-                    break
-
-            # If using non-STAT values, offer naming options
-            final_name = stat_name
-        if has_non_stat_values:
-            StatusIndicator("warning").add_message(
-                "Some coordinates don't match STAT table values"
-            ).emit()
-            cs.emit("\nNaming options:")
-
-            # Generate axis-based name
-            axis_name_parts = []
-            for tag, val in sorted_coords:
-                val_str = f"{int(val)}" if val == int(val) else f"{val}"
-                axis_name_parts.append(f"{tag}{val_str}")
-            axis_name = "".join(axis_name_parts)
-
-            cs.emit(f"  1. {stat_name} (STAT-derived, may be generic)")
-            cs.emit(f"  2. {axis_name} (descriptive coordinates)")
-            cs.emit("  3. Custom name (manual input)")
-
-            choice = input("\nChoice [1]: ").strip()
-            if choice == "2":
-                final_name = axis_name
-            elif choice == "3":
-                custom = input("Enter custom subfamily name: ").strip()
-                final_name = custom if custom else stat_name
-
-        cs.emit(
-            f"\n{cs.indent(1)}Filename: {family_name}-{final_name.replace(' ', '')}"
-        )
-
-        confirm = input("\nGenerate this instance? [Y/n]: ").strip().lower()
-        if confirm in ["", "y", "yes"]:
-            return (coordinates, final_name)
-        return None
+            if key in ("f", "from", "copy"):
+                mx = self._max_table_slot_number()
+                if mx == 0:
+                    _emit_dim("  No fvar instances in this font.")
+                    continue
+                cs.emit("")
+                cs.emit(
+                    "  Copy coordinates from one row in the numbered list (same # you use below)."
+                )
+                cs.emit(
+                    "  Then you set each axis again: Enter keeps that row's value; "
+                    "type a new number to change only that axis."
+                )
+                _emit_dim("  (m = return to custom menu without copying)")
+                raw = input(f"  Which table row # (1–{mx})? > ").strip()
+                _raise_if_quit(raw)
+                tok = raw.lower().split()[0] if raw.strip() else ""
+                if tok in ("m", "main", "menu"):
+                    continue
+                try:
+                    slot = int(raw)
+                except ValueError:
+                    _emit_dim("  Not a number")
+                    continue
+                base_inst = self._instance_for_table_slot(slot)
+                if base_inst is None:
+                    _emit_dim(f"  No instance #{slot}")
+                    continue
+                base_coords = dict(base_inst.coordinates)
+                base_label = base_inst.stat_name or base_inst.fvar_name
+                base_preview = "  ".join(
+                    _format_coord_part(k, v)
+                    for k, v in _sorted_coord_items(base_coords)
+                )
+                cs.emit(f"\n  Base: {base_preview}  ({base_label})")
+                cs.emit("  Adjust each axis (Enter = keep base value).")
+                self._queue_one_custom_instance(
+                    queue,
+                    font_path,
+                    stat_parser,
+                    variable_axes,
+                    fixed_axes,
+                    base_coords,
+                )
+            elif key in ("n", "new"):
+                cs.emit(
+                    "\n  New instance — axis values (Enter = default for each axis)."
+                )
+                self._queue_one_custom_instance(
+                    queue,
+                    font_path,
+                    stat_parser,
+                    variable_axes,
+                    fixed_axes,
+                    None,
+                )
+            else:
+                if not key:
+                    _emit_dim(
+                        "  Type an option key (see menu). [m] returns to the main menu "
+                        "without generating."
+                    )
+                else:
+                    _emit_dim("  Unknown option")
+                continue
 
     def _print_header(self, title: str) -> None:
         """Print section header."""
@@ -1454,6 +2226,15 @@ class InteractivePrompt:
         """Print validation notices about the font."""
         notices = []
 
+        dup_skipped = count_coordinate_duplicate_rows(self.metadata.instances)
+        if dup_skipped > 0:
+            notices.append(
+                f"{dup_skipped} named instance row(s) repeat an earlier coordinate set "
+                f"(axis values compared with epsilon {AXIS_VALUE_EPSILON}); "
+                "only the first row per coordinate set is generated by default. Use "
+                "--all-fvar-instance-rows to emit every fvar record including repeats."
+            )
+
         # Check for instances with no STAT mapping
         for inst in self.metadata.instances:
             if inst.stat_name == "Regular" and inst.fvar_name != UNKNOWN_FVAR_NAME:
@@ -1482,7 +2263,7 @@ class InteractivePrompt:
                 status.add_item(notice, indent_level=1)
             status.emit()
 
-            cs.emit("\nSuggested actions:", style="bold")
+            _emit_bold("\nSuggested actions:")
             cs.emit("  1. Check STAT table completeness")
             cs.emit("  2. Verify instance coordinates match STAT values")
             cs.emit("  3. Consider using [stat] naming mode (default)")
@@ -1920,6 +2701,9 @@ class FontProcessor:
                     for axis_tag, values in self.metadata.stat_values.items()
                 },
                 "source_italic": self.metadata.source_italic,
+                "coordinate_duplicate_row_count": count_coordinate_duplicate_rows(
+                    self.metadata.instances
+                ),
             }
             print(json.dumps(output, indent=2))
         else:
@@ -1943,31 +2727,24 @@ class FontProcessor:
         )
         self.last_generator = generator
 
-        while True:
-            result = ui.show_custom_mode(
-                self.font_path, self.metadata.axes, self.stat_parser
-            )
-            if result is None:
-                break
+        batch = ui.show_custom_mode(
+            self.font_path, self.metadata.axes, self.stat_parser
+        )
+        if not batch:
+            _emit_dim("  Left custom instance builder — nothing generated.")
+            return
 
-            coordinates, custom_name = result
-            print(f"\nGenerating: {custom_name}")
+        cs.emit(f"\nGenerating {cs.fmt_count(len(batch))} custom instance(s)...")
+        for coordinates, custom_name in batch:
             output_path = generator.generate_instance(coordinates, custom_name)
-
             if output_path:
-                filename = Path(output_path).name
-                cs.emit("")
                 StatusIndicator("success", dry_run=self.config.dry_run).add_message(
                     "Generated"
-                ).add_file(filename, filename_only=True).emit()
-
-            another = input("\nCreate another instance? [y/N]: ").strip().lower()
-            if another not in ["y", "yes"]:
-                break
+                ).add_file(Path(output_path).name, filename_only=True).emit()
 
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
-            print(
+            cs.emit(
                 f"\nGenerated {generator.successful_count} instance(s) in: {output_dir}"
             )
 
@@ -1979,13 +2756,24 @@ class FontProcessor:
         self.metadata = self.analyzer.analyze()
         self.stat_parser = self.analyzer.stat_parser
 
-        ui = InteractivePrompt(self.metadata, self.stat_parser)
+        selection, _ = instances_for_processing(self.metadata, self.config)
 
-        result = ui.show_instance_selection()
-        if result is None:
-            return
+        ui = InteractivePrompt(
+            self.metadata,
+            self.stat_parser,
+            selection_instances=selection,
+            coordinate_dedupe_active=self.config.skip_coordinate_duplicates,
+        )
 
-        instances_with_modes, default_mode = result
+        while True:
+            result = ui.show_instance_selection()
+            if result is None:
+                return
+            if result == "custom":
+                self.run_custom_mode()
+                continue
+            instances_with_modes, default_mode = result
+            break
 
         naming_strategy = InstanceNamingStrategy(
             self.metadata, self.stat_parser, default_mode
@@ -2001,10 +2789,10 @@ class FontProcessor:
 
         if not instances_with_modes:  # Generate all
             cs.emit(
-                f"\nGenerating {cs.fmt_count(len(self.metadata.instances))} instances..."
+                f"\nGenerating {cs.fmt_count(len(selection))} instances..."
             )
 
-            for inst_num, inst in enumerate(self.metadata.instances, 1):
+            for inst_num, inst in enumerate(selection, 1):
                 final_name = naming_strategy.resolve_name(inst)
 
                 output_path = generator.generate_instance(inst.coordinates, final_name)
@@ -2018,7 +2806,7 @@ class FontProcessor:
             )
 
             for idx, mode in instances_with_modes:
-                inst = self.metadata.instances[idx]
+                inst = selection[idx]
                 inst_num = idx + 1
 
                 # Create strategy for this specific mode
@@ -2046,7 +2834,10 @@ class FontProcessor:
         
         Args:
             json_output: If True, output JSON instead of console messages
-            instance_indices: Optional list of instance indices to generate (0-based). If None, generates all.
+            instance_indices: If None, generate every processing row from ``instances_for_processing``.
+                If a list (possibly empty), 0-based indices into that list ``selection``.
+                CLI ``--instance`` values are interpreted in ``main()`` as fvar ``#`` column
+                numbers (`InstanceInfo.index + 1`) and converted to these indices.
         """
         if not self.analyzer.load_and_validate():
             if json_output:
@@ -2068,19 +2859,44 @@ class FontProcessor:
         )
         self.last_generator = generator
 
-        # Filter instances if indices specified
-        instances_to_generate = self.metadata.instances
+        selection, coord_dedupe_skipped = instances_for_processing(
+            self.metadata, self.config
+        )
+
+        instances_to_generate = selection
         if instance_indices is not None:
             instances_to_generate = [
-                inst for inst in self.metadata.instances
-                if inst.index in instance_indices
+                selection[i]
+                for i in instance_indices
+                if isinstance(i, int) and 0 <= i < len(selection)
             ]
 
         if not json_output:
+            has_fvar_names = any(
+                inst.fvar_name != UNKNOWN_FVAR_NAME
+                for inst in self.metadata.instances
+            )
+            ui = InteractivePrompt(
+                self.metadata,
+                self.stat_parser,
+                selection_instances=selection,
+                coordinate_dedupe_active=self.config.skip_coordinate_duplicates,
+            )
+            ui._print_header("Named Instances")
+            any_names_differ, has_dup_coords = ui._print_instances_table_with_naming(
+                show_naming_comparison=has_fvar_names,
+                show_legend_banners=False,
+            )
+            ui._print_table_legend(any_names_differ, has_dup_coords, has_fvar_names)
             mode_label = self.config.naming_mode.value
             cs.emit(
-                f"Auto-generating {cs.fmt_count(len(instances_to_generate))} instances ({mode_label} names)..."
+                f"\nAuto-generating {cs.fmt_count(len(instances_to_generate))} instances ({mode_label} names)..."
             )
+            if coord_dedupe_skipped > 0:
+                StatusIndicator("info").add_message(
+                    f"Skipped {coord_dedupe_skipped} redundant fvar row(s) with duplicate "
+                    "coordinates (default; --all-fvar-instance-rows emits all rows)"
+                ).emit()
 
         generated_files = []
         for inst_num, inst in enumerate(instances_to_generate, 1):
@@ -2104,6 +2920,9 @@ class FontProcessor:
                 "success": generator.successful_count > 0,
                 "generated_count": generator.successful_count,
                 "total_instances": len(self.metadata.instances),
+                "processing_rows": len(selection),
+                "unique_coordinates_mode": self.config.skip_coordinate_duplicates,
+                "skipped_duplicate_coordinate_rows": coord_dedupe_skipped,
                 "files": generated_files,
                 "output_dir": str(self.config.output_dir or Path(self.font_path).parent)
             }
@@ -2155,18 +2974,16 @@ class FontProcessor:
             if not name or coordinates is None:
                 skipped += 1
                 if not json_output:
-                    cs.emit(
+                    _emit_dim(
                         f"  [skip] Missing 'name' or 'coordinates': {item}",
-                        style="dim",
                     )
                 continue
 
             if not isinstance(coordinates, dict):
                 skipped += 1
                 if not json_output:
-                    cs.emit(
+                    _emit_dim(
                         f"  [skip] Invalid coordinates for '{name}': expected dict",
-                        style="dim",
                     )
                 continue
 
@@ -2175,9 +2992,8 @@ class FontProcessor:
             for tag, val in coordinates.items():
                 if tag not in axis_by_tag:
                     if not json_output:
-                        cs.emit(
+                        _emit_dim(
                             f"  [skip] '{name}': axis '{tag}' not in font",
-                            style="dim",
                         )
                     valid = False
                     break
@@ -2185,18 +3001,16 @@ class FontProcessor:
                     v = float(val)
                 except (TypeError, ValueError):
                     if not json_output:
-                        cs.emit(
+                        _emit_dim(
                             f"  [skip] '{name}': non-numeric value for {tag}",
-                            style="dim",
                         )
                     valid = False
                     break
                 if not axis_by_tag[tag].is_in_range(v):
                     if not json_output:
-                        cs.emit(
+                        _emit_dim(
                             f"  [skip] '{name}': {tag}={val} outside range "
                             f"{axis_by_tag[tag].min_value}–{axis_by_tag[tag].max_value}",
-                            style="dim",
                         )
                     valid = False
                     break
@@ -2383,6 +3197,9 @@ Output Control
   %(prog)s font.ttf -y -ks
       Keep STAT table in generated instances
       
+  %(prog)s font.ttf -y --all-fvar-instance-rows
+      Emit every fvar instance row, including duplicate coordinate sets
+      
   %(prog)s font.ttf -dry
       Preview what would be generated (no files created)
 
@@ -2466,7 +3283,11 @@ fvar-raw Names (-r)
         "-i",
         "--instance",
         type=str,
-        help="Generate specific instance(s) by index (e.g., 7 or 1,3,5)",
+        help=(
+            "Comma-separated fvar instance slots (numbers in the '#' column; "
+            "duplicate-coordinate slots—purple row, gold #—are rejected unless "
+            "--all-fvar-instance-rows)."
+        ),
     )
     parser.add_argument(
         "-c",
@@ -2505,6 +3326,27 @@ fvar-raw Names (-r)
         "--keep-stat",
         action="store_true",
         help="Keep STAT table in static instances (removed by default)",
+    )
+    parser.set_defaults(skip_coordinate_duplicates=True)
+    parser.add_argument(
+        "-uc",
+        "--unique-coordinates",
+        dest="skip_coordinate_duplicates",
+        action="store_true",
+        help=(
+            "Keep only the first fvar instance row per coordinate set (default). "
+            f"Axes compared after snapping to multiples of {AXIS_VALUE_EPSILON}. "
+            "Same as default; kept for existing scripts."
+        ),
+    )
+    parser.add_argument(
+        "--all-fvar-instance-rows",
+        dest="skip_coordinate_duplicates",
+        action="store_false",
+        help=(
+            "Generate every fvar instance record, including rows whose coordinates match "
+            "an earlier row (disables default duplicate-coordinate skipping)."
+        ),
     )
 
     # Display options
@@ -2653,50 +3495,6 @@ fvar-raw Names (-r)
     else:
         naming_mode = NamingMode.STAT  # default
 
-    # Handle batch processing confirmation
-    if len(font_files) > 1 and not args.yes:
-        cs.emit(f"\n{cs.fmt_count(len(font_files))} fonts found")
-        print("\nBatch Processing Options:")
-        print("  [y] Auto-generate all instances for all fonts")
-        print("  [n] Interactive mode for each font")
-        print("  [q] Cancel operation")
-
-        confirm = input("\nYour choice [y/n/q]: ").strip().lower()
-
-        if confirm in ["q", "quit"]:
-            StatusIndicator("info").add_message("Operation cancelled").emit()
-            return 0
-        elif confirm in ["", "y", "yes"]:
-            # Ask for naming strategy
-            print("\nNaming strategy for batch processing:")
-            print("  [s] STAT names (default)")
-            print("  [f] fvar-hybrid names")
-            print("  [r] fvar-raw names")
-
-            naming_choice = input("\nYour choice [s]: ").strip().lower()
-
-            if naming_choice in ["f", "fvar-hybrid"]:
-                naming_mode = NamingMode.FVAR_HYBRID
-                cs.emit("\nAuto-generating all instances with fvar-hybrid naming...")
-            elif naming_choice in ["r", "fvar-raw"]:
-                naming_mode = NamingMode.FVAR_RAW
-                cs.emit("\nAuto-generating all instances with fvar-raw naming...")
-            else:
-                naming_mode = NamingMode.STAT
-                cs.emit("\nAuto-generating all instances with STAT naming...")
-
-            # Auto-confirm for all fonts
-            args.yes = True
-        elif confirm in ["n", "no"]:
-            # Interactive mode for each font
-            cs.emit("\nEntering interactive mode for each font...")
-            # Don't set args.yes - let each font go through interactive mode
-        else:
-            StatusIndicator("warning").add_message(
-                "Invalid choice. Defaulting to auto-generate."
-            ).emit()
-            args.yes = True
-
     # Determine output directory
     output_dir = None
     if args.output_dir:
@@ -2714,6 +3512,9 @@ fvar-raw Names (-r)
         keep_stat=args.keep_stat,
         naming_mode=naming_mode,
         dry_run=args.dry_run,
+        skip_coordinate_duplicates=getattr(
+            args, "skip_coordinate_duplicates", True
+        ),
     )
 
     # Show header
@@ -2760,20 +3561,60 @@ fvar-raw Names (-r)
                     # Parse instance indices if --instance specified
                     instance_indices = None
                     if args.instance:
-                        # Load metadata first to validate indices
+                        # Resolve --instance slots (match interactive '#' column: inst.index + 1)
                         if processor.analyzer.load_and_validate():
                             processor.metadata = processor.analyzer.analyze()
                             try:
-                                # Parse comma-separated list (1-based, convert to 0-based)
-                                indices = [int(x.strip()) - 1 for x in args.instance.split(",")]
-                                # Validate indices
                                 if processor.metadata:
-                                    instance_indices = [
-                                        idx for idx in indices 
-                                        if 0 <= idx < len(processor.metadata.instances)
+                                    slot_nums = [
+                                        int(x.strip())
+                                        for x in args.instance.split(",")
+                                        if x.strip()
                                     ]
+                                    processing_rows, _ = instances_for_processing(
+                                        processor.metadata, config
+                                    )
+                                    kept_slots = coordinate_first_kept_instance_indices(
+                                        processor.metadata.instances
+                                    )
+                                    mx_slot = (
+                                        max(
+                                            i.index + 1 for i in processor.metadata.instances
+                                        )
+                                        if processor.metadata.instances
+                                        else 0
+                                    )
+                                    instance_indices = []
+                                    for slot in slot_nums:
+                                        picked = None
+                                        for ti in processor.metadata.instances:
+                                            if ti.index + 1 == slot:
+                                                picked = ti
+                                                break
+                                        if picked is None:
+                                            StatusIndicator("warning").add_message(
+                                                f"--instance slot {slot} out of range (1-{mx_slot})"
+                                            ).emit()
+                                            continue
+                                        if (
+                                            config.skip_coordinate_duplicates
+                                            and picked.index not in kept_slots
+                                        ):
+                                            StatusIndicator("warning").add_message(
+                                                f"--instance {slot} repeats coordinates of an earlier row "
+                                                "(skipped by default; pass --all-fvar-instance-rows to include)"
+                                            ).emit()
+                                            continue
+                                        try:
+                                            instance_indices.append(
+                                                processing_rows.index(picked)
+                                            )
+                                        except ValueError:
+                                            StatusIndicator("warning").add_message(
+                                                f"--instance slot {slot} could not be resolved"
+                                            ).emit()
                             except (ValueError, AttributeError):
-                                pass  # Invalid format, generate all
+                                pass  # Invalid format; run_auto_mode generates all instances
                     
                     processor.run_auto_mode(json_output=args.json, instance_indices=instance_indices)
                     if hasattr(processor, "metadata") and processor.metadata:
@@ -2825,7 +3666,7 @@ fvar-raw Names (-r)
 
             # Show errors by context
             for context, count in error_summary["by_context"].items():
-                cs.emit(f"  • {context}: {count} error(s)", style="dim")
+                _emit_dim(f"  • {context}: {count} error(s)")
 
         # Show success summary
         cs.emit("")
