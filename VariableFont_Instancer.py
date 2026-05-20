@@ -87,16 +87,20 @@ def _emit_menu(text: str) -> None:
         cs.emit(text)
 
 
-def _emit_menu_row(label: str, body: str, *, label_col: int = 16) -> None:
+def _emit_menu_row(
+    label: str, body: str, *, label_col: int = 16, dim_hint: str = ""
+) -> None:
     """One menu line: bold label, body starts at a fixed column (aligned)."""
     pad_len = max(1, label_col - len(label))
     pad = " " * pad_len
     if RICH_AVAILABLE:
         from rich.markup import escape
 
-        cs.emit(f"  [bold]{escape(label)}[/bold]{pad}{escape(body)}")
+        hint = f" [dim]{escape(dim_hint)}[/dim]" if dim_hint else ""
+        cs.emit(f"  [bold]{escape(label)}[/bold]{pad}{escape(body)}{hint}")
     else:
-        cs.emit(f"  {label}{pad}{body}")
+        hint = f" — {dim_hint}" if dim_hint else ""
+        cs.emit(f"  {label}{pad}{body}{hint}")
 
 
 def _raise_if_quit(line: str) -> None:
@@ -357,6 +361,7 @@ class FontMetadata:
     instances: List[InstanceInfo]
     stat_values: Dict[str, Dict[float, str]]
     source_italic: bool
+    family_name: str
 
 
 # ============================================================================
@@ -825,12 +830,14 @@ class FontAnalyzer:
         axes = self._extract_axes()
         instances = self._extract_instances()
         source_italic = self._detect_source_italic()
+        family_name = self._extract_family_name()
 
         metadata = FontMetadata(
             axes=axes,
             instances=instances,
             stat_values=self.stat_parser.stat_values,
             source_italic=source_italic,
+            family_name=family_name,
         )
 
         # Update STAT names with family context
@@ -856,6 +863,17 @@ class FontAnalyzer:
             )
 
         return axes
+
+    def _extract_family_name(self) -> str:
+        """Typographic family from name IDs 1 / 16 (already-loaded font)."""
+        if not self.font or "name" not in self.font:
+            return Path(self.font_path).stem.split("-")[0]
+        name_table = self.font["name"]
+        raw = name_table.getDebugName(1) or name_table.getDebugName(16) or ""
+        family = strip_variable_tokens(raw) or raw
+        if not family or family == UNKNOWN_FVAR_NAME:
+            return Path(self.font_path).stem.split("-")[0]
+        return family
 
     def _extract_instances(self) -> List[InstanceInfo]:
         """Extract instance information from fvar table."""
@@ -1030,17 +1048,21 @@ class InteractivePrompt:
             metadata.instances
         )
 
+    def _table_slot_number(self, inst: InstanceInfo) -> int:
+        """1-based # column label (fvar instance order), matching the instance table."""
+        return inst.index + 1
+
     def _instance_for_table_slot(self, slot_number: int) -> Optional[InstanceInfo]:
         """Resolve UI # column (fvar instance order label) to an InstanceInfo."""
         for inst in self.metadata.instances:
-            if inst.index + 1 == slot_number:
+            if self._table_slot_number(inst) == slot_number:
                 return inst
         return None
 
     def _max_table_slot_number(self) -> int:
         if not self.metadata.instances:
             return 0
-        return max(inst.index + 1 for inst in self.metadata.instances)
+        return max(self._table_slot_number(inst) for inst in self.metadata.instances)
 
     def _default_naming_mode(self) -> NamingMode:
         """fvar-hybrid when fvar names exist; STAT otherwise."""
@@ -1151,6 +1173,36 @@ class InteractivePrompt:
         # Validation
         self._print_validation_notices()
 
+    def _prompt_advanced_selection(
+        self, has_fvar_names: bool, default_mode: NamingMode
+    ) -> Optional[Tuple[List[Tuple[int, NamingMode]], NamingMode]]:
+        """Per-slot naming DSL; loops until valid input or back ([x])."""
+        cs.emit("")
+        _emit_menu("  Advanced — per-slot naming")
+        _emit_menu(
+            "    Suffix each slot:  s=STAT   r=raw   f=fvar-hybrid     "
+            "(e.g. 1s 2r 3f)"
+        )
+        _emit_menu(
+            "    Or:  stat:1,2 fvar:3     s1 r2 f3     "
+            "[x] back to instances   [q] quit"
+        )
+        while True:
+            adv = input("  > ").strip()
+            _raise_if_quit(adv)
+            tok = adv.strip().lower().split()[0] if adv.strip() else ""
+            if not tok or tok in ("x", "cancel", "back"):
+                return None
+            parsed = self._parse_instance_selection(adv, has_fvar_names)
+            if parsed is None:
+                _emit_dim(
+                    "  Could not parse — try 1s 2r 3f or stat:1,2   "
+                    "[x] back to instances"
+                )
+                continue
+            adv_mode = parsed[0][1] if parsed else default_mode
+            return (parsed, adv_mode)
+
     def show_instance_selection(
         self,
     ) -> Optional[Union[Literal["custom"], Tuple[List[Tuple[int, NamingMode]], NamingMode]]]:
@@ -1163,9 +1215,10 @@ class InteractivePrompt:
             Generate all    [Enter] …   [s] STAT   …     (label bold)
             Pick subset     type slot numbers, e.g. 1 3 7   (label bold)
             Other           [c] … [a] … [?] …            (label bold)
+            (spacer line)   [x] skip this font   [q] quit
 
         Returns:
-            None                                        — skip this font ([w] or skip)
+            None                                        — skip this font ([x] or skip)
             "custom"                                    — route to custom mode
             ([], mode)                                  — generate all with mode
             ([(processing_idx, mode), …], mode)         — generate specific instances
@@ -1202,11 +1255,14 @@ class InteractivePrompt:
             _emit_menu_row(
                 "Pick subset",
                 "type slot numbers, e.g.  1  3  7",
+                dim_hint="then choose naming",
             )
             _emit_menu_row(
                 "Other",
-                "[c] custom   [a] advanced   [?] help   [w] skip font   [q] quit",
+                "[c] custom   [a] advanced   [?] help",
             )
+            cs.emit("")
+            _emit_menu("                  [x] skip this font   [q] quit")
 
             response = input("  > ").strip().lower()
 
@@ -1214,7 +1270,7 @@ class InteractivePrompt:
             if response in ("q", "quit"):
                 raise SystemExit(0)
             rsp0 = response.split()[0] if response else ""
-            if rsp0 in ("w", "skip"):
+            if rsp0 in ("x", "skip"):
                 return None
             if response in ("?", "help"):
                 self._show_help_panel(has_fvar_names, default_mode)
@@ -1224,41 +1280,12 @@ class InteractivePrompt:
 
             # --- Advanced DSL (per-slot naming) ---
             if response in ("a", "advanced"):
-                cs.emit("")
-                _emit_menu("  Advanced — per-slot naming")
-                _emit_menu(
-                    "    Suffix each slot:  s=STAT   r=raw   f=fvar-hybrid     "
-                    "(e.g. 1s 2r 3f)"
+                adv_result = self._prompt_advanced_selection(
+                    has_fvar_names, default_mode
                 )
-                _emit_menu(
-                    "    Or:  stat:1,2 fvar:3     s1 r2 f3     "
-                    "[m] return to table   [q] quit"
-                )
-                adv = input("  > ").strip()
-                _raise_if_quit(adv)
-                adv_key = adv.strip().lower().split()[0] if adv.strip() else ""
-                if not adv_key or adv_key in ("m", "main", "menu"):
+                if adv_result is None:
                     continue
-                parsed = self._parse_instance_selection(adv, has_fvar_names)
-                if parsed is None:
-                    cs.emit("")
-                    _emit_menu(
-                        "    Invalid. Try: 1s 2r 3f  or  stat:1,2   "
-                        "[m] return to table   [q] quit"
-                    )
-                    adv2 = input("  > ").strip()
-                    _raise_if_quit(adv2)
-                    adv2_key = adv2.strip().lower().split()[0] if adv2.strip() else ""
-                    if not adv2_key or adv2_key in ("m", "main", "menu"):
-                        continue
-                    parsed = self._parse_instance_selection(adv2, has_fvar_names)
-                    if parsed is None:
-                        StatusIndicator("warning").add_message(
-                            "Could not parse advanced selection. Skipping font."
-                        ).emit()
-                        return None
-                adv_mode = parsed[0][1] if parsed else default_mode
-                return (parsed, adv_mode)
+                return adv_result
 
             # --- Generate-all shortcut keys ---
             if has_fvar_names:
@@ -1277,16 +1304,17 @@ class InteractivePrompt:
             if indices is None:
                 cs.emit("")
                 _emit_menu(
-                    "    Enter slot numbers (e.g. 1 3 7), a mode key, or [?] for help."
+                    "    Enter slot numbers (e.g. 1 3 7), a mode key, [?], "
+                    "[x] back, or type skip to skip this font."
                 )
                 response2 = input("  > ").strip().lower()
                 if response2 in ("q", "quit"):
                     raise SystemExit(0)
                 r20 = response2.split()[0] if response2 else ""
-                if r20 in ("w", "skip"):
-                    return None
-                if response2 == "":
+                if r20 == "x" or response2 == "":
                     continue
+                if r20 == "skip" or response2 == "skip":
+                    return None
                 if response2 in ("?", "help"):
                     self._show_help_panel(has_fvar_names, default_mode)
                     continue
@@ -1640,22 +1668,26 @@ class InteractivePrompt:
                 "",
                 "[bold]PICK SUBSET[/bold]   [dim]type slot numbers[/dim]",
                 "  Enter [turquoise2]#[/turquoise2] column values, space or comma separated —"
-                "  e.g. [turquoise2]1 3 7[/turquoise2]",
-                "  Naming mode is asked as a follow-up.",
+                "  e.g. [turquoise2]1 3 7[/turquoise2] [dim](then choose naming)[/dim]",
                 "",
                 "[bold]ADVANCED[/bold]   [dim]a[/dim]",
                 "  Per-instance naming mode: [turquoise2]1s 2f 3r[/turquoise2]"
                 "   or   [turquoise2]stat:1,2 fvar:3[/turquoise2]",
                 "  Useful when different instances need different naming modes.",
-                "  [dim]Empty line or[/dim] [turquoise2]m[/turquoise2] [dim]returns to the table.[/dim]",
+                "  [dim]Empty line or[/dim] [turquoise2]x[/turquoise2] "
+                "[dim]back to the instance table.[/dim]",
                 "",
                 "[bold]CUSTOM[/bold]   [dim]c[/dim]",
-                "  [turquoise2]n[/turquoise2] new instance, [turquoise2]f[/turquoise2] copy a table # row "
-                "then tweak axes, [turquoise2]g[/turquoise2] generate all pending, "
-                "[turquoise2]m[/turquoise2] return to named-instance menu.",
+                "  Build instances with exact axis coordinates. Queue as many as you need,",
+                "  then [turquoise2]g[/turquoise2] to generate all at once.",
+                "  [turquoise2]n[/turquoise2] new from scratch  · "
+                "[turquoise2]f[/turquoise2] copy and adjust an existing fvar instance  · "
+                "[turquoise2]r[/turquoise2] remove one  ·  [turquoise2]c[/turquoise2] clear queue  ·  "
+                "[turquoise2]x[/turquoise2] back without generating",
                 "",
-                "[bold]SKIP FONT[/bold]   [dim]w[/dim]",
-                "  At the instance table menu: skip this file (batch) or leave without generating.",
+                "[bold]SKIP FONT[/bold]   [dim]x[/dim] (instance table)",
+                "  Skip this file in a batch, or leave without generating instances.",
+                "  In axis entry, [turquoise2]x[/turquoise2] only cancels that custom instance.",
             ]
 
             legend_section: List[str] = [
@@ -1692,10 +1724,10 @@ class InteractivePrompt:
             cs.emit("")
             cs.emit("ACTIONS")
             cs.emit("  Enter (or s/f/r)  Generate all instances with chosen mode")
-            cs.emit("  1 3 7             Pick specific instances by # column")
-            cs.emit("  a                 Advanced: per-instance naming (m = return to table)")
-            cs.emit("  c                 Custom builder (see help)")
-            cs.emit("  w / skip          Skip this font")
+            cs.emit("  1 3 7             Pick instances by # column (then choose naming)")
+            cs.emit("  a                 Advanced (empty / x = back to table)")
+            cs.emit("  c                 Custom builder (n/f/g/r/c; x back without generating)")
+            cs.emit("  x / skip          Skip this font")
             cs.emit("  q                 Quit program")
             cs.emit("")
             cs.emit("TABLE LEGEND")
@@ -1852,14 +1884,14 @@ class InteractivePrompt:
         variable_axes: List[AxisInfo],
         base_coords: Optional[Dict[str, float]] = None,
     ) -> Optional[Dict[str, float]]:
-        """Walk each variable axis; Enter keeps value; b/back = previous axis; x = cancel."""
+        """Walk each variable axis; Enter keeps value; [p] previous axis; [x] cancel draft."""
         def _fmt(v: float) -> str:
             if v == int(v):
                 return str(int(v))
             return str(v)
 
         _emit_dim(
-            "    Enter = keep  ·  b / back = previous axis  ·  x / skip = cancel"
+            "    [Enter] = keep  ·  [p] previous axis  ·  [x] cancel this instance"
         )
 
         coords: Dict[str, float] = {}
@@ -1878,12 +1910,13 @@ class InteractivePrompt:
                 raw = input(prompt).strip()
                 _raise_if_quit(raw)
                 low = raw.lower()
-                if low in ("x", "skip"):
+                first_tok = low.split()[0] if low else ""
+                if first_tok in ("x", "cancel"):
                     return None
-                if low in ("b", "back", "u", "undo"):
+                if first_tok in ("p", "prev", "previous"):
                     if i == 0:
                         _emit_dim(
-                            "      Already on the first axis — use x to cancel this instance."
+                            "      Already on the first axis — [x] cancels this instance."
                         )
                         continue
                     prev = variable_axes[i - 1]
@@ -1914,13 +1947,12 @@ class InteractivePrompt:
     def _queue_one_custom_instance(
         self,
         queue: List[_PendingInstance],
-        font_path: str,
         stat_parser: STATNameParser,
         variable_axes: List[AxisInfo],
         fixed_axes: List[AxisInfo],
         base_coords: Optional[Dict[str, float]],
     ) -> None:
-        """Prompt for coordinates + name and append to queue, or return if axes cancelled."""
+        """Prompt for coordinates + name and append to queue, or return if cancelled."""
         while True:
             coords = self._prompt_axis_values(variable_axes, base_coords)
             if coords is None:
@@ -1942,76 +1974,74 @@ class InteractivePrompt:
             if RICH_AVAILABLE:
                 from rich.markup import escape
 
-                hint = (
-                    "  [dim](between STAT values)[/dim]" if has_non_stat else ""
-                )
+                hint = "  [dim](between STAT values)[/dim]" if has_non_stat else ""
                 cs.emit(
                     f"  → STAT name: [pale_green1]{escape(str(stat_name))}[/pale_green1]"
-                    + hint
+                    f"{hint}"
                 )
             else:
-                cs.emit(
-                    f"  → STAT name: {stat_name}"
-                    + ("  (between STAT values)" if has_non_stat else "")
-                )
+                h = "  (between STAT values)" if has_non_stat else ""
+                cs.emit(f"  → STAT name: {stat_name}{h}")
 
             name_raw = input(
-                "  Name [Enter=STAT   t=custom   b=re-edit axes] > "
+                f"  Name [Enter={stat_name}, or type  ·  e=re-edit  ·  x=cancel] > "
             ).strip()
             _raise_if_quit(name_raw)
-            nk = name_raw.lower()
-            if nk in ("b", "back", "u", "undo"):
+            nl = name_raw.lower()
+
+            if nl in ("x", "cancel"):
+                return
+            if nl in ("e", "edit", "re-edit", "reedit"):
                 continue
-            if nk == "t":
-                typed = input("  Custom name > ").strip()
-                _raise_if_quit(typed)
-                final_name = typed if typed else stat_name
-            elif name_raw == "":
+            if name_raw == "":
                 final_name = stat_name
             else:
                 final_name = name_raw
 
-            try:
-                temp_font = TTFont(font_path)
-                family_name = (
-                    temp_font["name"].getDebugName(1)
-                    or temp_font["name"].getDebugName(16)
-                    or UNKNOWN_FVAR_NAME
-                )
-                family_name = strip_variable_tokens(family_name) or family_name
-                temp_font.close()
-            except Exception:
-                family_name = Path(font_path).stem.split("-")[0]
+            family_name = self.metadata.family_name
 
             _emit_dim(
                 f"  Filename: {family_name}-{final_name.replace(' ', '')}",
             )
 
             queue.append(_PendingInstance(coordinates=dict(coords), name=final_name))
-            _emit_dim(
-                f"  Added to queue ({len(queue)} pending). [g] generate all pending, "
-                "[n] new instance, [m] main menu."
-            )
+            _emit_dim(f"  Added ({len(queue)} pending).")
             return
 
-    def _emit_instance_rows_for_custom_copy(self) -> None:
-        """Numbered fvar rows so standalone custom mode can use [f] without the big table."""
-        if not self.metadata.instances:
-            return
-        cs.emit("")
-        cs.emit("  # — coordinates — name   (for [f]: type # to copy that row, then edit)")
-        for inst in self.metadata.instances:
-            coord = "  ".join(
-                _format_coord_part(k, v)
-                for k, v in _sorted_coord_items(inst.coordinates)
+    def _emit_custom_menu(self, queue: List[_PendingInstance]) -> None:
+        """Two-line custom builder menu; dim g/r/c when queue is empty (Rich).
+
+        Rich treats ``[letter]`` as markup. Shortcut keys must be passed through
+        ``rich.markup.escape`` (or use ``_emit_menu`` on lines with no raw markup).
+        """
+        if not RICH_AVAILABLE:
+            _emit_menu(
+                "  [n] new   [f] from fvar #   [g] generate all   "
+                "[r] remove #   [c] clear"
             )
-            label = inst.stat_name or inst.fvar_name
-            cs.emit(f"    {inst.index + 1:>3}  {coord}  ({label})")
+            _emit_menu("  [x] back   [q] quit")
+            if not queue:
+                _emit_dim("  ([g] / [r] / [c] after you queue instances.)")
+            return
+
+        from rich.markup import escape
+
+        lead = f"  {escape('[n]')} new   {escape('[f]')} from fvar #   "
+        tail = escape("[g] generate all   [r] remove #   [c] clear")
+        if queue:
+            cs.emit(lead + tail)
+        else:
+            cs.emit(lead + f"[dim]{tail}[/dim]")
+        _emit_menu("  [x] back   [q] quit")
 
     def show_custom_mode(
         self, font_path: str, axes: List[AxisInfo], stat_parser: STATNameParser
-    ) -> List[Tuple[Dict[str, float], str]]:
-        """Queue-based custom builder; returns batches to generate (empty = exit)."""
+    ) -> Optional[List[Tuple[Dict[str, float], str]]]:
+        """Queue-based custom builder.
+
+        Returns a list of (coordinates, name) to generate, or None if the user
+        backs out without generating (``[x]``).
+        """
         _ = axes  # signature compatibility; axes come from self._classify_axes()
         variable_axes, fixed_axes = self._classify_axes()
 
@@ -2022,51 +2052,41 @@ class InteractivePrompt:
                 "This font has no variable axes — all coordinates are fixed."
             ).emit()
             input("\nPress Enter to continue...")
+            # Return [] (not None) — distinguishable from user cancel (None) by run_custom_mode,
+            # but both result in no generation. The caller's `if not batch:` handles both.
             return []
 
+        self._print_header("Custom Instance Builder")
+        self._print_axes_table()
+        cs.emit("")
+
         queue: List[_PendingInstance] = []
-        listed_copy_rows = False
 
         while True:
-            self._print_header("Custom Instance Builder")
-            self._print_axes_table()
-            if not listed_copy_rows and self.metadata.instances:
-                listed_copy_rows = True
-                self._emit_instance_rows_for_custom_copy()
-
-            cs.emit("")
             if queue:
                 noun = "instance" if len(queue) == 1 else "instances"
-                cs.emit(f"  Pending ({len(queue)} {noun}):")
+                cs.emit(f"\n  Pending ({len(queue)} {noun}):")
                 for i, item in enumerate(queue, 1):
                     cs.emit(f"    {i}.  {item.display()}")
             else:
-                _emit_dim("  Pending (0 instances):  none yet")
+                _emit_dim("\n  Pending:  (none)")
 
             cs.emit("")
-            _emit_menu(
-                "  [n] new instance   [f] copy table row, tweak axes   "
-                "[m] main menu   [q] quit"
-            )
-            if queue:
-                _emit_menu(
-                    "  [r] remove from queue   [g] generate all pending   "
-                    "[c] clear queue"
-                )
+            self._emit_custom_menu(queue)
 
             choice_line = input("  > ").strip()
             _raise_if_quit(choice_line)
             choice = choice_line.lower()
             key = choice.split()[0] if choice else ""
 
-            if key in ("m", "main", "menu"):
-                return []
+            if key in ("x", "cancel", "back"):
+                return None
 
             if key in ("g", "go", "generate"):
                 if queue:
                     return [(p.coordinates, p.name) for p in queue]
                 _emit_dim(
-                    "  Nothing queued yet — [n] new instance or [f] copy table row."
+                    "  Nothing queued — add an instance with [n] or [f] first."
                 )
                 continue
 
@@ -2100,18 +2120,21 @@ class InteractivePrompt:
                     _emit_dim("  No fvar instances in this font.")
                     continue
                 cs.emit("")
-                cs.emit(
-                    "  Copy coordinates from one row in the numbered list (same # you use below)."
-                )
-                cs.emit(
-                    "  Then you set each axis again: Enter keeps that row's value; "
-                    "type a new number to change only that axis."
-                )
-                _emit_dim("  (m = return to custom menu without copying)")
-                raw = input(f"  Which table row # (1–{mx})? > ").strip()
+                cs.emit("  Copy from fvar:")
+                for inst in self.metadata.instances:
+                    coord = "  ".join(
+                        _format_coord_part(k, v)
+                        for k, v in _sorted_coord_items(inst.coordinates)
+                    )
+                    label = inst.stat_name or inst.fvar_name
+                    slot = self._table_slot_number(inst)
+                    cs.emit(f"    {slot:<3} {coord}  ({label})")
+                raw = input(
+                    f"  Which # (1–{mx})?  [x] cancel > "
+                ).strip()
                 _raise_if_quit(raw)
                 tok = raw.lower().split()[0] if raw.strip() else ""
-                if tok in ("m", "main", "menu"):
+                if tok in ("x", "cancel"):
                     continue
                 try:
                     slot = int(raw)
@@ -2129,10 +2152,9 @@ class InteractivePrompt:
                     for k, v in _sorted_coord_items(base_coords)
                 )
                 cs.emit(f"\n  Base: {base_preview}  ({base_label})")
-                cs.emit("  Adjust each axis (Enter = keep base value).")
+                cs.emit("  Adjust each axis ([Enter] keeps the value shown).")
                 self._queue_one_custom_instance(
                     queue,
-                    font_path,
                     stat_parser,
                     variable_axes,
                     fixed_axes,
@@ -2140,11 +2162,10 @@ class InteractivePrompt:
                 )
             elif key in ("n", "new"):
                 cs.emit(
-                    "\n  New instance — axis values (Enter = default for each axis)."
+                    "\n  New instance — axis values ([Enter] = default for each axis)."
                 )
                 self._queue_one_custom_instance(
                     queue,
-                    font_path,
                     stat_parser,
                     variable_axes,
                     fixed_axes,
@@ -2153,8 +2174,7 @@ class InteractivePrompt:
             else:
                 if not key:
                     _emit_dim(
-                        "  Type an option key (see menu). [m] returns to the main menu "
-                        "without generating."
+                        "  Choose n / f / g / …   [x] back without generating."
                     )
                 else:
                     _emit_dim("  Unknown option")
@@ -2170,57 +2190,69 @@ class InteractivePrompt:
 
         if variable_axes:
             cs.emit("\nVariable Axes:")
-            table = cs.create_table(
+            var_table = cs.create_table(
                 show_header=True, row_styles=["on #282a39", "on #1d1f30"]
             )
-        if table:
-            # Set table width to match console width
-            table.width = console.size.width
-            table.add_column("Tag", style="cyan1")
-            table.add_column("Name", style="pale_green1")
-            table.add_column("Range", style="turquoise2")
-            table.add_column("STAT Values", style="dim", no_wrap=False)
+            if var_table:
+                var_table.width = console.size.width
+                var_table.add_column("Tag", style="cyan1")
+                var_table.add_column("Name", style="pale_green1")
+                var_table.add_column("Range", style="turquoise2")
+                var_table.add_column("STAT Values", style="dim", no_wrap=False)
 
-            for axis in variable_axes:
-                stat_values = self._format_stat_values_inline(axis.tag)
-                table.add_row(
-                    axis.tag, axis.name, axis.format_variable_range(), stat_values
-                )
+                for axis in variable_axes:
+                    stat_values = self._format_stat_values_inline(axis.tag)
+                    var_table.add_row(
+                        axis.tag,
+                        axis.name,
+                        axis.format_variable_range(),
+                        stat_values,
+                    )
 
-            console.print(table)
-        else:
-            for axis in variable_axes:
-                stat_values = self._format_stat_values_inline(axis.tag)
-                cs.emit(
-                    f"  {axis.tag:6} {axis.name:12} {axis.format_variable_range():20} {stat_values}"
-                )
+                console.print(var_table)
+            else:
+                for axis in variable_axes:
+                    stat_values = self._format_stat_values_inline(axis.tag)
+                    cs.emit(
+                        f"  {axis.tag:6} {axis.name:12} "
+                        f"{axis.format_variable_range():20} {stat_values}"
+                    )
 
         if fixed_axes:
             cs.emit("\nFixed Axes:")
-            table = cs.create_table(
+            fix_table = cs.create_table(
                 show_header=True, row_styles=["on #282a39", "on #1d1f30"]
             )
-        if table:
-            # Set table width to match console width
-            table.width = console.size.width
-            table.add_column("Tag", style="cyan1")
-            table.add_column("Name", style="pale_green1")
-            table.add_column("Value", style="turquoise2")
-            table.add_column("Note", style="dim", no_wrap=False)
+            if fix_table:
+                fix_table.width = console.size.width
+                fix_table.add_column("Tag", style="cyan1")
+                fix_table.add_column("Name", style="pale_green1")
+                fix_table.add_column("Value", style="turquoise2")
+                fix_table.add_column("Note", style="dim", no_wrap=False)
 
-            for axis in fixed_axes:
-                stat_values = self._format_stat_values_inline(axis.tag)
-                note = f"All instances will use {stat_values if stat_values else 'this value'}"
-                table.add_row(axis.tag, axis.name, f"{axis.min_value} [FIXED]", note)
+                for axis in fixed_axes:
+                    stat_values = self._format_stat_values_inline(axis.tag)
+                    note = (
+                        f"Fixed at {stat_values if stat_values else str(axis.min_value)}"
+                    )
+                    fix_table.add_row(
+                        axis.tag,
+                        axis.name,
+                        f"{axis.min_value}",
+                        note,
+                    )
 
-            console.print(table)
-        else:
-            for axis in fixed_axes:
-                stat_values = self._format_stat_values_inline(axis.tag)
-                cs.emit(f"  {axis.tag:6} {axis.name:12} {axis.min_value} [FIXED]")
-                cs.emit(
-                    f"    → All instances will use {stat_values if stat_values else 'this value'}"
-                )
+                console.print(fix_table)
+            else:
+                for axis in fixed_axes:
+                    stat_values = self._format_stat_values_inline(axis.tag)
+                    cs.emit(
+                        f"  {axis.tag:6} {axis.name:12} {axis.min_value} [FIXED]"
+                    )
+                    cs.emit(
+                        "    → All instances will use "
+                        f"{stat_values if stat_values else 'this value'}"
+                    )
 
     def _print_validation_notices(self) -> None:
         """Print validation notices about the font."""
@@ -2694,6 +2726,7 @@ class FontProcessor:
         if json_output:
             # Output JSON format
             output = {
+                "family_name": self.metadata.family_name,
                 "axes": [asdict(axis) for axis in self.metadata.axes],
                 "instances": [asdict(inst) for inst in self.metadata.instances],
                 "stat_values": {
@@ -2771,6 +2804,13 @@ class FontProcessor:
                 return
             if result == "custom":
                 self.run_custom_mode()
+                # run_custom_mode sets last_generator; successful_count reflects this visit.
+                gen = self.last_generator
+                if gen is not None and gen.successful_count > 0:
+                    _emit_dim(
+                        f"  ↩ Returned from custom builder "
+                        f"({gen.successful_count} instance(s) generated)."
+                    )
                 continue
             instances_with_modes, default_mode = result
             break
