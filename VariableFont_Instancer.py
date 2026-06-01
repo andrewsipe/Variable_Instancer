@@ -56,6 +56,7 @@ from FontCore.core_name_policies import (
     strip_variable_tokens,
     normalize_fvar_name,
 )
+from FontCore.core_gpos_repair import repair_pairpos_second_glyph_order
 from FontCore.core_ttx_table_io import deduplicate_namerecords_binary
 from FontCore.core_file_collector import collect_font_files
 from FontCore.core_error_handling import ErrorTracker, ErrorContext
@@ -2332,11 +2333,13 @@ class InstanceGenerator:
         stat_parser: STATNameParser,
         config: InstancerConfig,
         error_tracker: Optional[ErrorTracker] = None,
+        metadata: Optional["FontMetadata"] = None,
     ):
         self.analyzer = analyzer
         self.stat_parser = stat_parser
         self.config = config
         self.error_tracker = error_tracker or ErrorTracker()
+        self.metadata = metadata
         self.successful_count = 0
 
     def generate_instance(
@@ -2352,6 +2355,13 @@ class InstanceGenerator:
 
             # Create fresh font copy
             instance_font = TTFont(self.analyzer.font_path)
+
+            pairpos_fixes = repair_pairpos_second_glyph_order(instance_font)
+            if pairpos_fixes:
+                logger.debug(
+                    "Reordered PairPos targets before instancing: %s",
+                    pairpos_fixes,
+                )
 
             # Instantiate
             instancer.instantiateVariableFont(
@@ -2550,6 +2560,63 @@ class InstanceGenerator:
         except Exception as e:
             logger.warning(f"Failed to deduplicate name records: {e}")
 
+    def _compute_width_class(self, wdth_value: float) -> int:
+        """Compute a relative usWidthClass (1–9) from a wdth axis value.
+
+        The OS/2 spec defines usWidthClass as an integer 1–9 where 5 is
+        "Normal / Regular".  Because the axis range is designer-defined and
+        has no fixed relationship to those nine slots, we derive the value
+        proportionally:
+
+          • The axis *default* always maps to 5 (Normal).
+          • Values below the default are mapped linearly from the axis minimum
+            (→ 1, Ultra-Condensed) up to the default (→ 5, Normal).
+          • Values above the default are mapped linearly from the default
+            (→ 5) up to the axis maximum (→ 9, Ultra-Expanded).
+
+        If the font has no wdth axis the current OS/2 value is left unchanged
+        (this method returns None in that case, handled by the caller).
+
+        The result is clamped to [1, 9] for safety.
+        """
+        metadata = self.metadata
+        if metadata is None:
+            return None
+
+        wdth_axis = next(
+            (a for a in metadata.axes if a.tag == "wdth"), None
+        )
+        if wdth_axis is None:
+            return None
+
+        default = wdth_axis.default_value
+        min_val = wdth_axis.min_value
+        max_val = wdth_axis.max_value
+
+        # Axis with no real range — treat everything as Normal (5)
+        if min_val >= max_val:
+            return 5
+
+        if abs(wdth_value - default) < 0.001:
+            return 5
+
+        if wdth_value < default:
+            # Condensed side: [min_val, default] → [1, 5]
+            span = default - min_val
+            if span < 0.001:
+                return 5
+            ratio = (wdth_value - min_val) / span   # 0.0 at min → 1.0 at default
+            width_class = 1.0 + ratio * 4.0          # 1 at min → 5 at default
+        else:
+            # Expanded side: [default, max_val] → [5, 9]
+            span = max_val - default
+            if span < 0.001:
+                return 5
+            ratio = (wdth_value - default) / span    # 0.0 at default → 1.0 at max
+            width_class = 5.0 + ratio * 4.0          # 5 at default → 9 at max
+
+        return max(1, min(9, round(width_class)))
+
     def _update_metrics_and_bits(
         self, font: TTFont, is_italic: bool, coordinates: Dict[str, float]
     ) -> None:
@@ -2568,9 +2635,21 @@ class InstanceGenerator:
                 ):
                     is_bold = True
 
-        # Update OS/2 weight class
+        # Update OS/2 weight class and width class
         if "OS/2" in font:
             font["OS/2"].usWeightClass = int(round(weight))
+
+            # Set usWidthClass relative to the wdth axis range so that the
+            # axis default always maps to 5 (Normal), condensed instances
+            # count down toward 1, and expanded instances count up toward 9.
+            wdth_value = coordinates.get("wdth")
+            if wdth_value is not None:
+                computed_width_class = self._compute_width_class(wdth_value)
+                if computed_width_class is not None:
+                    font["OS/2"].usWidthClass = computed_width_class
+                    logger.debug(
+                        "Set usWidthClass=%d for wdth=%.2f", computed_width_class, wdth_value
+                    )
 
             # Update fsSelection
             selection = font["OS/2"].fsSelection
@@ -2757,6 +2836,7 @@ class FontProcessor:
             self.stat_parser,
             self.config,
             error_tracker=self.error_tracker,
+            metadata=self.metadata,
         )
         self.last_generator = generator
 
@@ -2824,6 +2904,7 @@ class FontProcessor:
             self.stat_parser,
             self.config,
             error_tracker=self.error_tracker,
+            metadata=self.metadata,
         )
         self.last_generator = generator
 
@@ -2896,6 +2977,7 @@ class FontProcessor:
             self.stat_parser,
             self.config,
             error_tracker=self.error_tracker,
+            metadata=self.metadata,
         )
         self.last_generator = generator
 
@@ -2997,6 +3079,7 @@ class FontProcessor:
             self.stat_parser,
             self.config,
             error_tracker=self.error_tracker,
+            metadata=self.metadata,
         )
         self.last_generator = generator
 
