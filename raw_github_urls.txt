@@ -3,6 +3,7 @@ https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/.gitmodules
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/FontCore
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/README.md
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/VariableFont_Instancer.py
+https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/VariableFont_TableEditor.py
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/requirements.txt
 
 # FontCore/
