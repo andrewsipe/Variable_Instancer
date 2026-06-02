@@ -46,11 +46,15 @@ from FontCore.core_nameid_allocator import (
     audit_nameids,
     build_allocation_plan,
     check_for_collisions,
+    compose_instance_name,
+    compose_postscript_instance_name,
+    derive_family_ps_prefix,
     enumerate_instance_names,
 )
 from FontCore.core_ot_label_scanner import scan_ot_label_nameids
 from FontCore.core_stat_builder import (
     apply_table_edits,
+    build_protected_name_ids,
     count_instances,
     default_fix_summary,
     generate_ttx_additions,
@@ -79,6 +83,7 @@ class EditorConfig:
     dry_run: bool = False
     fix_fvar_default: bool = True
     info_only: bool = False
+    allocate_postscript_names: bool = True
 
 
 def _load_instancer_module():
@@ -180,34 +185,47 @@ def _extract_axes(font: TTFont) -> Dict[str, AxisInfo]:
 
 def _suggest_elidable(value: float, name: str, axis_def: AxisDef) -> bool:
     """
-    Default for the Elidable? prompt (Enter accepts the default).
-
-    wght + Regular/Roman → False so instance names stay "Condensed Regular",
-    not "Condensed". Other ELIDABLE_WEIGHT_NAMES (Book, Text, …) may still
-    default to True on wght; width Normal/Standard/Regular still elide on wdth.
+    Option A — "Condensed Regular" style: Regular/Roman on wght stay visible in
+    composed instance names (default Elidable? = N). Width Normal/Standard still
+    elide on wdth.
     """
     name_stripped = name.strip()
-    if axis_def.tag == "wght" and name_stripped in ("Regular", "Roman"):
-        return False
     if abs(value - axis_def.default_value) < 0.001:
+        if axis_def.tag == "wght" and name_stripped in ("Regular", "Roman"):
+            return False
         return True
     if axis_def.tag == "wght" and name_stripped in ELIDABLE_WEIGHT_NAMES:
+        if name_stripped in ("Regular", "Roman"):
+            return False
         return True
     if axis_def.tag == "wdth" and name_stripped in ELIDABLE_WIDTH_NAMES:
         return True
     return False
 
 
-def _stat_label_hint(stat_parser: Optional[STATNameParser], axis_tag: str, value: float) -> str:
-    """STAT name hint for prompts; uses instancer parser when available."""
-    if not stat_parser:
+def _stat_hint_for_value(
+    stat_parser: Optional[STATNameParser], axis_tag: str, value: float
+) -> str:
+    stat_hint = ""
+    if stat_parser and hasattr(stat_parser, "stat_values"):
+        stat_hint = stat_parser.stat_values.get(axis_tag, {}).get(value) or ""
+    return stat_hint
+
+
+def _stat_hint_for_name(
+    stat_parser: Optional[STATNameParser], axis_tag: str, name: str
+) -> str:
+    if not stat_parser or not hasattr(stat_parser, "stat_values"):
         return ""
-    if hasattr(stat_parser, "get_label_for_axis"):
-        return stat_parser.get_label_for_axis(axis_tag, value) or ""
-    axis_map = getattr(stat_parser, "stat_values", {}).get(axis_tag, {})
-    if value in axis_map:
-        return axis_map[value]
+    needle = name.strip().lower()
+    for val, label in stat_parser.stat_values.get(axis_tag, {}).items():
+        if label.strip().lower() == needle:
+            return f'hint: "{label}"'
     return ""
+
+
+def _emit_warning(text: str) -> None:
+    cs.emit(f"⚠ {text}")
 
 
 def _prompt_float(message: str) -> float:
@@ -221,7 +239,7 @@ def _prompt_float(message: str) -> float:
         try:
             return float(line)
         except ValueError:
-            cs.emit("  Enter a numeric value.")
+            _emit_warning("Invalid value — enter a numeric value.")
 
 
 def _suggest_stat_format(axis_tag: str) -> int:
@@ -329,142 +347,241 @@ def _build_ital_axis_def(is_italic_font: bool) -> AxisDef:
     override = cs.prompt_input("[o] override / Enter to accept: ").strip().lower()
     _raise_if_quit(override)
     if override == "o":
-        return _prompt_axis_values_interactive(
-            AxisDef(
-                tag="ital",
-                display_name="Italic",
-                min_value=0.0,
-                default_value=1.0 if is_italic_font else 0.0,
-                max_value=1.0,
-                values=[],
-            ),
-            stat_parser=None,
+        ital_def = AxisDef(
+            tag="ital",
+            display_name="Italic",
+            min_value=0.0,
+            default_value=1.0 if is_italic_font else 0.0,
+            max_value=1.0,
+            values=[],
         )
+        result = _define_axis_count_first(ital_def, None)
+        return result if result is not None else _ital_axis_def_silent(is_italic_font)
     return _ital_axis_def_silent(is_italic_font)
 
 
-def _prompt_axis_values_interactive(
+def _display_axis_summary(axis_def: AxisDef) -> None:
+    """Compact per-axis confirmation table."""
+    title = f"{axis_def.display_name} — {len(axis_def.values)} instances"
+    table = cs.create_table(show_header=True, title=title)
+    if table is not None:
+        table.add_column("Name")
+        table.add_column("Value", justify="right")
+        table.add_column("Elidable", justify="center")
+        for av in axis_def.values:
+            el = "✓" if av.elidable else ""
+            table.add_row(av.name, f"{av.value:g}", el)
+        console.print(table)
+    else:
+        for av in axis_def.values:
+            el = " (elidable)" if av.elidable else ""
+            cs.emit(f"  {av.name:16s}  {av.value:g}{el}")
+
+
+def _prompt_format_fields(
+    stat_format: int,
+) -> Optional[Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Return (range_min, range_max, linked_value) or None to restart instance."""
+    range_min = range_max = linked_value = None
+    if stat_format == 2:
+        raw_min = cs.prompt_input("  Range min: ").strip()
+        _raise_if_quit(raw_min)
+        raw_max = cs.prompt_input("  Range max: ").strip()
+        _raise_if_quit(raw_max)
+        try:
+            range_min = float(raw_min)
+            range_max = float(raw_max)
+        except ValueError:
+            _emit_warning("Invalid range — enter numeric values.")
+            return None
+    elif stat_format == 3:
+        raw_linked = cs.prompt_input("  Linked value: ").strip()
+        _raise_if_quit(raw_linked)
+        try:
+            linked_value = float(raw_linked)
+        except ValueError:
+            _emit_warning("Invalid value — enter a numeric value.")
+            return None
+    return range_min, range_max, linked_value
+
+
+def _define_axis_count_first(
     axis_def: AxisDef,
     stat_parser: Optional[STATNameParser],
-) -> AxisDef:
-    values: List[AxisValueDef] = list(axis_def.values)
-
+) -> Optional[AxisDef]:
+    """
+    Count-first axis definition. Returns None when user backs out to previous axis.
+    """
     while True:
         cs.emit_section_separator()
-        _emit_bold(f"Defining values for:  {axis_def.tag}  ({axis_def.display_name})")
+        _emit_bold(f"Defining axis: {axis_def.tag}  ({axis_def.display_name})")
         cs.emit(
             f"Range: {axis_def.min_value:g} — {axis_def.max_value:g}   "
-            f"Current default: {axis_def.default_value:g}"
+            f"Default: {axis_def.default_value:g}"
         )
-        if stat_parser:
+        if stat_parser and hasattr(stat_parser, "stat_values"):
             existing = stat_parser.stat_values.get(axis_def.tag, {})
             if existing:
-                cs.emit(
-                    "Existing STAT: "
-                    + ", ".join(f"{v:g}={n}" for v, n in sorted(existing.items()))
-                )
+                stat_txt = ", ".join(f"{v:g}={n}" for v, n in sorted(existing.items()))
+                cs.emit(f"Existing STAT values (reference only): {stat_txt}")
             else:
-                cs.emit("Existing STAT values: (none)")
+                cs.emit("Existing STAT values (reference only): (none)")
 
-        line = cs.prompt_input("Enter a value (or 'done' · 'back' · 'q'): ").strip()
-        _raise_if_quit(line)
-        low = line.lower()
-        if low == "done":
-            break
-        if low == "back":
-            if values:
-                removed = values.pop()
-                cs.emit(f"Removed {axis_def.tag}={removed.value:g} ({removed.name})")
-            else:
-                cs.emit("No values to remove.")
-            continue
-        if not line:
-            continue
-
-        try:
-            value = float(line)
-        except ValueError:
-            cs.emit("Enter a numeric axis value.")
-            continue
-
-        if not (axis_def.min_value <= value <= axis_def.max_value):
-            cs.emit(
-                f"Value must be within [{axis_def.min_value:g}, {axis_def.max_value:g}]"
-            )
-            continue
-
-        duplicate = False
-        for existing in values:
-            if abs(existing.value - value) < 0.001:
-                cs.emit(
-                    f"{axis_def.tag}={value:g} already defined as {existing.name!r}"
-                )
-                duplicate = True
-                break
-        if duplicate:
-            continue
-
-        stat_hint = _stat_label_hint(stat_parser, axis_def.tag, value)
-        name_prompt = f"  Name for {axis_def.tag}={value:g}"
-        if stat_hint:
-            name_prompt += f" [{stat_hint}]"
-        name_prompt += ": "
-        name = cs.prompt_input(name_prompt).strip()
-        _raise_if_quit(name)
-        if not name:
-            cs.emit("Name cannot be empty.")
-            continue
-
-        suggest_el = _suggest_elidable(value, name, axis_def)
-        elidable = cs.prompt_confirm("Elidable?", default=suggest_el)
-
-        fmt_default = _suggest_stat_format(axis_def.tag)
-        fmt_line = cs.prompt_input(
-            f"STAT format [1=point / 2=range / 3=linked, Enter={fmt_default}]: "
+        count_line = cs.prompt_input(
+            f"How many instances for {axis_def.display_name}? (or 'back' · 'q'): "
         ).strip()
-        _raise_if_quit(fmt_line)
-        if fmt_line:
-            try:
-                stat_format = int(fmt_line)
-            except ValueError:
-                cs.emit("Format must be 1, 2, or 3.")
-                continue
-        else:
-            stat_format = fmt_default
-        if stat_format not in (1, 2, 3):
-            cs.emit("Format must be 1, 2, or 3.")
+        _raise_if_quit(count_line)
+        if count_line.lower() == "back":
+            return None
+        try:
+            count = int(count_line)
+        except ValueError:
+            cs.emit("Enter a whole number ≥ 1.")
+            continue
+        if count < 1:
+            cs.emit("Enter a whole number ≥ 1.")
             continue
 
-        range_min = range_max = linked_value = None
-        if stat_format == 2:
-            range_min = _prompt_float("  Range min: ")
-            range_max = _prompt_float("  Range max: ")
-        elif stat_format == 3:
-            linked_value = _prompt_float("  Linked value: ")
+        values: List[AxisValueDef] = []
+        instance_idx = 1
+        while instance_idx <= count:
+            cs.emit(f"\n  [{instance_idx} of {count}]  {axis_def.display_name}")
+            name_line = cs.prompt_input("  Name: ").strip()
+            _raise_if_quit(name_line)
+            if name_line.lower() == "back":
+                if instance_idx == 1:
+                    break
+                instance_idx -= 1
+                values.pop()
+                continue
+            if not name_line:
+                cs.emit("  Name cannot be empty.")
+                continue
 
-        av = AxisValueDef(
-            value=value,
-            name=name,
-            elidable=elidable,
-            stat_format=stat_format,
-            range_min=range_min,
-            range_max=range_max,
-            linked_value=linked_value,
-        )
-        values.append(av)
-        el_txt = "YES" if elidable else "No"
-        cs.emit(
-            f"  Added: {axis_def.tag}={value:g}  {name!r}  elidable={el_txt}  "
-            f"format={stat_format}"
-        )
+            name_hint = _stat_hint_for_name(stat_parser, axis_def.tag, name_line)
+            if name_hint:
+                cs.emit(f"  {name_hint}")
 
-    axis_def.values = values
-    if values:
-        cs.emit(f"\n{axis_def.tag} — {len(values)} values defined:")
-        for av in values:
-            el = "YES" if av.elidable else "No"
-            cs.emit(f"  {av.value:g}  {av.name}  elidable={el}")
-    return axis_def
+            value_line = cs.prompt_input("  Value: ").strip()
+            _raise_if_quit(value_line)
+            if value_line.lower() == "back":
+                continue
+            try:
+                value = float(value_line)
+            except ValueError:
+                cs.emit("  Enter a numeric value.")
+                continue
+
+            if not (axis_def.min_value <= value <= axis_def.max_value):
+                cs.emit(
+                    f"  Value must be within [{axis_def.min_value:g}, "
+                    f"{axis_def.max_value:g}]"
+                )
+                continue
+            if value != round(value) and axis_def.tag in ("wght", "wdth", "opsz"):
+                _emit_warning("Non-integer coordinate (allowed).")
+
+            dup = any(abs(v.value - value) < 0.001 for v in values)
+            if dup:
+                cs.emit(f"  Value {value:g} already used in this axis.")
+                continue
+
+            value_hint = _stat_hint_for_value(stat_parser, axis_def.tag, value)
+            if value_hint and value_hint.lower() != name_line.strip().lower():
+                cs.emit(f'  STAT label at {value:g}: "{value_hint}"')
+
+            suggest_el = _suggest_elidable(value, name_line, axis_def)
+            el_default = "Y" if suggest_el else "N"
+            el_line = cs.prompt_input(
+                f"  Elidable? (suggested: {el_default}) [Y/n]: "
+            ).strip().lower()
+            _raise_if_quit(el_line)
+            if el_line in ("", "y", "yes"):
+                elidable = suggest_el if el_line == "" else True
+            elif el_line in ("n", "no"):
+                elidable = False
+            else:
+                elidable = suggest_el
+
+            fmt_default = _suggest_stat_format(axis_def.tag)
+            fmt_line = cs.prompt_input(
+                f"  STAT format [1/2/3, Enter={fmt_default}]: "
+            ).strip()
+            _raise_if_quit(fmt_line)
+            if fmt_line:
+                try:
+                    stat_format = int(fmt_line)
+                except ValueError:
+                    cs.emit("  Format must be 1, 2, or 3.")
+                    continue
+            else:
+                stat_format = fmt_default
+            if stat_format not in (1, 2, 3):
+                cs.emit("  Format must be 1, 2, or 3.")
+                continue
+
+            fmt_fields = _prompt_format_fields(stat_format)
+            if fmt_fields is None:
+                continue
+            range_min, range_max, linked_value = fmt_fields
+
+            values.append(
+                AxisValueDef(
+                    value=value,
+                    name=name_line,
+                    elidable=elidable,
+                    stat_format=stat_format,
+                    range_min=range_min,
+                    range_max=range_max,
+                    linked_value=linked_value,
+                )
+            )
+            instance_idx += 1
+
+        if not values:
+            continue
+
+        axis_def.values = values
+        cs.emit_spacer()
+        _display_axis_summary(axis_def)
+
+        accept = cs.prompt_input("  Accept this axis? [Y/n/back]: ").strip().lower()
+        _raise_if_quit(accept)
+        if accept in ("", "y", "yes"):
+            return axis_def
+        if accept == "back":
+            return None
+        continue
+
+
+def _display_full_instance_preview(
+    axis_defs: List[AxisDef],
+    elided_fallback: str,
+    family_ps_prefix: str = "",
+    max_rows: int = 40,
+) -> None:
+    import itertools
+
+    value_lists = [ad.values for ad in axis_defs]
+    tag_list = [ad.tag for ad in axis_defs]
+    total = count_instances(axis_defs)
+    _emit_bold(f"{total} instances will be created:")
+    if family_ps_prefix:
+        _emit_dim(f"  PostScript prefix: {family_ps_prefix}")
+    cs.emit_spacer()
+    shown = 0
+    for combo in itertools.product(*value_lists):
+        composed = compose_instance_name(combo, elided_fallback)
+        coords = ", ".join(f"{t}={av.value:g}" for t, av in zip(tag_list, combo))
+        if family_ps_prefix:
+            ps = compose_postscript_instance_name(family_ps_prefix, composed)
+            cs.emit(f"  {composed:24s}  {ps:32s}  {coords}")
+        else:
+            cs.emit(f"  {composed:28s}  {coords}")
+        shown += 1
+        if shown >= max_rows:
+            _emit_dim(f"  … and {total - max_rows} more")
+            break
 
 
 def _interactive_axis_defs(
@@ -477,6 +594,8 @@ def _interactive_axis_defs(
     axis_defs: List[AxisDef] = []
     tags = [t for t in axis_order if t in axes]
     idx = 0
+    elided_fallback = "Regular"
+    family_ps_prefix = derive_family_ps_prefix(font)
 
     while idx < len(tags):
         tag = tags[idx]
@@ -492,7 +611,13 @@ def _interactive_axis_defs(
                 max_value=info.max_value,
                 values=[],
             )
-            ad = _prompt_axis_values_interactive(ad, stat_parser)
+            defined = _define_axis_count_first(ad, stat_parser)
+            if defined is None:
+                if axis_defs:
+                    axis_defs.pop()
+                    idx = max(0, idx - 1)
+                continue
+            ad = defined
 
         if idx < len(axis_defs):
             axis_defs[idx] = ad
@@ -500,19 +625,14 @@ def _interactive_axis_defs(
             axis_defs.append(ad)
 
         _default_mismatch_warnings(font, axis_defs, fix_fvar_default=True)
-
-        if idx < len(tags) - 1:
-            cont = cs.prompt_input(
-                "Continue to next axis? [Enter=yes / b=back / q=quit]: "
-            ).strip().lower()
-            _raise_if_quit(cont)
-            if cont == "b":
-                axis_defs.pop()
-                if idx > 0:
-                    idx -= 1
-                continue
-
         idx += 1
+
+    cs.emit_spacer()
+    _display_full_instance_preview(axis_defs, elided_fallback, family_ps_prefix)
+    if not cs.prompt_confirm("Proceed to nameID plan and write?", default=True):
+        return _interactive_axis_defs(
+            font, axes, axis_order, stat_parser, is_italic_font
+        )
 
     return axis_defs
 
@@ -607,18 +727,30 @@ def _save_yaml_config(
 def _display_plan_summary(plan, fix_lines: List[str]) -> None:
     n_axis_ids = len(plan.axis_value_ids)
     n_inst_ids = len(plan.instance_ids)
+    n_ps_ids = len({nid for nid in plan.instance_postscript_ids.values()})
     _emit_bold("NameID plan:")
+    if plan.family_ps_prefix:
+        cs.emit(f"  PostScript prefix: {plan.family_ps_prefix}")
     if n_axis_ids:
         cs.emit(
             f"  Axis value names: {n_axis_ids} new IDs  "
             f"({plan.free_start} – {plan.free_start + n_axis_ids - 1})"
         )
+    cursor_after_subfamily = plan.free_start + n_axis_ids
     if n_inst_ids:
-        inst_start = plan.free_start + n_axis_ids
         cs.emit(
-            f"  Instance names:   {n_inst_ids} new IDs  "
-            f"({inst_start} – {plan.free_end})"
+            f"  Instance subfamily: {n_inst_ids} new IDs  "
+            f"({cursor_after_subfamily} – "
+            f"{cursor_after_subfamily + n_inst_ids - 1})"
         )
+    if n_ps_ids:
+        ps_start = cursor_after_subfamily + n_inst_ids
+        cs.emit(
+            f"  Instance PostScript: {n_ps_ids} new IDs  "
+            f"({ps_start} – {plan.free_end})"
+        )
+    elif not n_inst_ids:
+        cs.emit(f"  (no new IDs; range ends at {plan.free_end})")
     for line in fix_lines:
         cs.emit(f"  fvar default: {line}")
 
@@ -651,6 +783,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Show axis/nameID audit only, then exit",
     )
+    parser.add_argument(
+        "--no-postscript-names",
+        action="store_true",
+        help="Do not allocate fvar postscriptNameID entries (use 0xFFFF)",
+    )
     args = parser.parse_args(argv)
 
     font_path = args.fontfile.expanduser().resolve()
@@ -670,6 +807,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         dry_run=args.dry_run,
         fix_fvar_default=not args.no_fix_default,
         info_only=args.info,
+        allocate_postscript_names=not args.no_postscript_names,
     )
 
     try:
@@ -725,7 +863,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     elided_fallback = "Regular"
     plan = build_allocation_plan(
-        font, ot_labels, axis_defs, elided_fallback_name=elided_fallback
+        font,
+        ot_labels,
+        axis_defs,
+        elided_fallback_name=elided_fallback,
+        allocate_postscript_names=editor.allocate_postscript_names,
     )
     collisions = check_for_collisions(plan, font)
     if collisions:
@@ -760,12 +902,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             cs.emit("Re-run the script to edit axis definitions.")
             return 0
 
+    protected_ids = build_protected_name_ids(font, ot_label_id_set)
+
     apply_table_edits(
         font,
         axis_defs,
         plan,
         elided_fallback_name=elided_fallback,
         fix_fvar_default=editor.fix_fvar_default,
+        protected_ids=protected_ids,
+        confirm_wipe=not editor.dry_run,
+        ot_label_count=len(ot_label_id_set),
     )
 
     output_path = _resolve_output_path(font_path, args.output)
