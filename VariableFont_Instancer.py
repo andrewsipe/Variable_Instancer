@@ -26,7 +26,7 @@ Usage:
   python script.py fontfile.ttf --info       # View font information
   python script.py fontfile.ttf --auto --naming stat    # Auto-generate (STAT)
   python script.py fontfile.ttf --auto --naming fvar    # Auto-generate (fvar hybrid)
-  python script.py fontfile.ttf -y   # Skips duplicate-coordinate fvar rows by default
+  python script.py fontfile.ttf -y   # Skips redundant fvar rows (same output identity) by default
   python script.py fontfile.ttf -y --all-fvar-instance-rows   # Emit every fvar row
 """
 
@@ -37,7 +37,7 @@ import sys
 from pathlib import Path
 from fontTools.ttLib import TTFont
 from fontTools.varLib import instancer
-from typing import Optional, List, Dict, Tuple, Union, Literal
+from typing import Optional, List, Dict, Tuple, Union, Literal, Callable
 from dataclasses import dataclass, asdict
 from enum import Enum
 
@@ -202,83 +202,9 @@ def instance_coordinate_key(
     return tuple((tag, snap(float(val))) for tag, val in sorted(coordinates.items()))
 
 
-def count_coordinate_duplicate_rows(instances: List["InstanceInfo"]) -> int:
-    """How many instances would be skipped if keeping only first occurrence per coordinate key."""
-    if len(instances) < 2:
-        return 0
-    seen: set[Tuple[Tuple[str, float], ...]] = set()
-    dups = 0
-    for inst in instances:
-        key = instance_coordinate_key(inst.coordinates)
-        if key in seen:
-            dups += 1
-        else:
-            seen.add(key)
-    return dups
-
-
-def unique_instances_by_coordinates(
-    instances: List["InstanceInfo"],
-) -> Tuple[List["InstanceInfo"], int]:
-    """Drop later fvar instances whose snapped coordinates match an earlier row. Returns (unique, num_skipped)."""
-    seen: set[Tuple[Tuple[str, float], ...]] = set()
-    out: List["InstanceInfo"] = []
-    skipped = 0
-    for inst in instances:
-        key = instance_coordinate_key(inst.coordinates)
-        if key in seen:
-            skipped += 1
-            continue
-        seen.add(key)
-        out.append(inst)
-    return out, skipped
-
-
-def coordinate_first_kept_instance_indices(
-    instances: List["InstanceInfo"],
-) -> set[int]:
-    """fvar instance indices (InstanceInfo.index) kept when deduping: first row per coordinate key."""
-    seen: set[Tuple[Tuple[str, float], ...]] = set()
-    kept: set[int] = set()
-    for inst in instances:
-        k = instance_coordinate_key(inst.coordinates)
-        if k not in seen:
-            kept.add(inst.index)
-            seen.add(k)
-    return kept
-
-
-def prior_duplicate_coordinate_slot_by_index(
-    instances: List["InstanceInfo"],
-) -> Dict[int, Optional[int]]:
-    """Map InstanceInfo.index -> earlier # column value (1-based) with same snapped coordinates.
-
-    First occurrence maps to None; later fvar rows map to that first slot number.
-    """
-    seen: Dict[Tuple[Tuple[str, float], ...], int] = {}
-    out: Dict[int, Optional[int]] = {}
-    for inst in sorted(instances, key=lambda i: i.index):
-        key = instance_coordinate_key(inst.coordinates)
-        slot = inst.index + 1
-        if key not in seen:
-            seen[key] = slot
-            out[inst.index] = None
-        else:
-            out[inst.index] = seen[key]
-    return out
-
-
-def instances_for_processing(
-    metadata: "FontMetadata", config: "InstancerConfig"
-) -> Tuple[List["InstanceInfo"], int]:
-    """
-    Instances to iterate for UI numbering and generation.
-    Returns (instances, duplicates_skipped) where duplicates_skipped is 0 unless dedupe is enabled.
-    """
-    if not config.skip_coordinate_duplicates:
-        return metadata.instances, 0
-    uniq, skipped = unique_instances_by_coordinates(metadata.instances)
-    return uniq, skipped
+def _collapse_name_key(name: str) -> str:
+    """Normalize a resolved output name for duplicate comparison."""
+    return re.sub(r"\s+", " ", name.strip()).casefold()
 
 
 @dataclass
@@ -1027,6 +953,138 @@ class InstanceNamingStrategy:
 
 
 # ============================================================================
+# Instance deduplication (output identity)
+# ============================================================================
+
+
+def default_naming_mode_for_instances(instances: List["InstanceInfo"]) -> NamingMode:
+    """fvar-hybrid when fvar names exist; STAT otherwise."""
+    has_fvar = any(inst.fvar_name != UNKNOWN_FVAR_NAME for inst in instances)
+    return NamingMode.FVAR_HYBRID if has_fvar else NamingMode.STAT
+
+
+def build_instance_output_name_resolver(
+    metadata: "FontMetadata",
+    stat_parser: "STATNameParser",
+    naming_mode: NamingMode,
+) -> Callable[["InstanceInfo"], str]:
+    """Return a callable that resolves the subfamily name used for filenames."""
+    strategy = InstanceNamingStrategy(metadata, stat_parser, naming_mode)
+    return strategy.resolve_name
+
+
+def instance_output_identity(
+    inst: "InstanceInfo",
+    resolve_output_name: Callable[["InstanceInfo"], str],
+) -> Tuple[Tuple[Tuple[str, float], ...], str]:
+    """Fingerprint for redundant fvar rows: snapped coordinates plus resolved output name."""
+    return (
+        instance_coordinate_key(inst.coordinates),
+        _collapse_name_key(resolve_output_name(inst)),
+    )
+
+
+def count_coordinate_duplicate_rows(
+    instances: List["InstanceInfo"],
+    metadata: "FontMetadata",
+    stat_parser: "STATNameParser",
+    naming_mode: NamingMode,
+) -> int:
+    """How many instances would be skipped if keeping only first occurrence per output identity."""
+    if len(instances) < 2:
+        return 0
+    resolve_name = build_instance_output_name_resolver(metadata, stat_parser, naming_mode)
+    seen: set[Tuple[Tuple[Tuple[str, float], ...], str]] = set()
+    dups = 0
+    for inst in instances:
+        key = instance_output_identity(inst, resolve_name)
+        if key in seen:
+            dups += 1
+        else:
+            seen.add(key)
+    return dups
+
+
+def unique_instances_by_coordinates(
+    instances: List["InstanceInfo"],
+    metadata: "FontMetadata",
+    stat_parser: "STATNameParser",
+    naming_mode: NamingMode,
+) -> Tuple[List["InstanceInfo"], int]:
+    """Drop later fvar rows that would produce the same output as an earlier row."""
+    resolve_name = build_instance_output_name_resolver(metadata, stat_parser, naming_mode)
+    seen: set[Tuple[Tuple[Tuple[str, float], ...], str]] = set()
+    out: List["InstanceInfo"] = []
+    skipped = 0
+    for inst in instances:
+        key = instance_output_identity(inst, resolve_name)
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        out.append(inst)
+    return out, skipped
+
+
+def coordinate_first_kept_instance_indices(
+    instances: List["InstanceInfo"],
+    metadata: "FontMetadata",
+    stat_parser: "STATNameParser",
+    naming_mode: NamingMode,
+) -> set[int]:
+    """fvar instance indices kept when deduping: first row per output identity."""
+    resolve_name = build_instance_output_name_resolver(metadata, stat_parser, naming_mode)
+    seen: set[Tuple[Tuple[Tuple[str, float], ...], str]] = set()
+    kept: set[int] = set()
+    for inst in instances:
+        key = instance_output_identity(inst, resolve_name)
+        if key not in seen:
+            kept.add(inst.index)
+            seen.add(key)
+    return kept
+
+
+def prior_duplicate_coordinate_slot_by_index(
+    instances: List["InstanceInfo"],
+    metadata: "FontMetadata",
+    stat_parser: "STATNameParser",
+    naming_mode: NamingMode,
+) -> Dict[int, Optional[int]]:
+    """Map InstanceInfo.index -> earlier # column value (1-based) with the same output identity."""
+    resolve_name = build_instance_output_name_resolver(metadata, stat_parser, naming_mode)
+    seen: Dict[Tuple[Tuple[Tuple[str, float], ...], str], int] = {}
+    out: Dict[int, Optional[int]] = {}
+    for inst in sorted(instances, key=lambda i: i.index):
+        key = instance_output_identity(inst, resolve_name)
+        slot = inst.index + 1
+        if key not in seen:
+            seen[key] = slot
+            out[inst.index] = None
+        else:
+            out[inst.index] = seen[key]
+    return out
+
+
+def instances_for_processing(
+    metadata: "FontMetadata",
+    config: "InstancerConfig",
+    stat_parser: "STATNameParser",
+    naming_mode: Optional[NamingMode] = None,
+) -> Tuple[List["InstanceInfo"], int]:
+    """
+    Instances to iterate for UI numbering and generation.
+    Returns (instances, duplicates_skipped) where duplicates_skipped is 0 unless dedupe is enabled.
+    """
+    if not config.skip_coordinate_duplicates:
+        return metadata.instances, 0
+    mode = naming_mode or config.naming_mode
+    uniq, skipped = unique_instances_by_coordinates(
+        metadata.instances, metadata, stat_parser, mode
+    )
+    return uniq, skipped
+
+
+# ============================================================================
 # Interactive UI
 # ============================================================================
 
@@ -1040,13 +1098,18 @@ class InteractivePrompt:
         stat_parser: STATNameParser,
         selection_instances: Optional[List[InstanceInfo]] = None,
         coordinate_dedupe_active: bool = False,
+        naming_mode: Optional[NamingMode] = None,
     ):
         self.metadata = metadata
         self.stat_parser = stat_parser
         self.selection_instances = selection_instances or metadata.instances
         self.coordinate_dedupe_active = coordinate_dedupe_active
+        self.dedupe_naming_mode = naming_mode or self._default_naming_mode()
         self._kept_coordinate_instance_indices = coordinate_first_kept_instance_indices(
-            metadata.instances
+            metadata.instances,
+            metadata,
+            stat_parser,
+            self.dedupe_naming_mode,
         )
 
     def _table_slot_number(self, inst: InstanceInfo) -> int:
@@ -1067,10 +1130,7 @@ class InteractivePrompt:
 
     def _default_naming_mode(self) -> NamingMode:
         """fvar-hybrid when fvar names exist; STAT otherwise."""
-        has_fvar = any(
-            inst.fvar_name != UNKNOWN_FVAR_NAME for inst in self.metadata.instances
-        )
-        return NamingMode.FVAR_HYBRID if has_fvar else NamingMode.STAT
+        return default_naming_mode_for_instances(self.metadata.instances)
 
     def _parse_numbers_only(
         self, response: str
@@ -1106,7 +1166,8 @@ class InteractivePrompt:
                 and inst_pick.index not in self._kept_coordinate_instance_indices
             ):
                 _emit_dim(
-                    f"  #{num} matches an earlier coordinate set (purple row + gold #); "
+                    f"  #{num} would repeat the output of an earlier row under "
+                    f"{self.dedupe_naming_mode.value} naming (purple row + gold #); "
                     "skipped by default; use --all-fvar-instance-rows to generate it."
                 )
                 return None
@@ -1426,8 +1487,18 @@ class InteractivePrompt:
             cs.emit("\nNo named instances found")
             return (False, False)
 
-        dup_coord_count = count_coordinate_duplicate_rows(self.metadata.instances)
-        prior_duplicate_slot = prior_duplicate_coordinate_slot_by_index(rows)
+        dup_coord_count = count_coordinate_duplicate_rows(
+            self.metadata.instances,
+            self.metadata,
+            self.stat_parser,
+            self.dedupe_naming_mode,
+        )
+        prior_duplicate_slot = prior_duplicate_coordinate_slot_by_index(
+            rows,
+            self.metadata,
+            self.stat_parser,
+            self.dedupe_naming_mode,
+        )
         has_dup_coords = dup_coord_count > 0
         dup_row_bg = "on #4b3652"
         any_names_differ = False
@@ -1553,14 +1624,16 @@ class InteractivePrompt:
                 if self.coordinate_dedupe_active:
                     StatusIndicator("info").add_message(
                         "[#fecf82 on #4b3652]◆ Purple-tinted rows[/#fecf82 on #4b3652]"
-                        " mark the same coordinates as an earlier row; "
+                        " would produce the same output as an earlier row under "
+                        f"{self.dedupe_naming_mode.value} naming; "
                         "those rows are omitted from generation by default "
                         "(use --all-fvar-instance-rows to emit them)."
                     ).emit()
                 else:
                     StatusIndicator("info").add_message(
                         "[#fecf82 on #4b3652]◆ Purple-tinted rows[/#fecf82 on #4b3652]"
-                        " are duplicate-coordinate rows. "
+                        " are redundant under the active naming mode "
+                        f"({self.dedupe_naming_mode.value}). "
                         "With --all-fvar-instance-rows they generate like any other when selected."
                     ).emit()
 
@@ -1614,10 +1687,10 @@ class InteractivePrompt:
                 parts.append(
                     "[#fecf82]◆[/#fecf82] "
                     "[#fecf82 on #4b3652] Purple [/#fecf82 on #4b3652]"
-                    " duplicate coordinates (skipped)"
+                    " redundant output (skipped)"
                 )
             else:
-                parts.append("◆ Purple = duplicate coordinates (skipped)")
+                parts.append("◆ Purple = redundant output (skipped)")
 
         if not parts:
             return
@@ -1733,7 +1806,7 @@ class InteractivePrompt:
             cs.emit("")
             cs.emit("TABLE LEGEND")
             cs.emit("  ■  Yellow = STAT/fvar names differ")
-            cs.emit("  ◆  Purple = duplicate coordinates (skipped by default)")
+            cs.emit("  ◆  Purple = redundant output (skipped by default)")
             cs.emit("  Bold text = Regular added by fvar-hybrid normalization")
             cs.emit("============\n")
 
@@ -1860,7 +1933,8 @@ class InteractivePrompt:
                     and inst_pick.index not in self._kept_coordinate_instance_indices
                 ):
                     _emit_dim(
-                        f"  Slot #{num} repeats coordinates of an earlier row (purple row + "
+                        f"  Slot #{num} would repeat the output of an earlier row under "
+                        f"{self.dedupe_naming_mode.value} naming (purple row + "
                         "gold # in the table). Skipped by default; use "
                         "--all-fvar-instance-rows to include."
                     )
@@ -2259,12 +2333,18 @@ class InteractivePrompt:
         """Print validation notices about the font."""
         notices = []
 
-        dup_skipped = count_coordinate_duplicate_rows(self.metadata.instances)
+        dup_skipped = count_coordinate_duplicate_rows(
+            self.metadata.instances,
+            self.metadata,
+            self.stat_parser,
+            self.dedupe_naming_mode,
+        )
         if dup_skipped > 0:
             notices.append(
-                f"{dup_skipped} named instance row(s) repeat an earlier coordinate set "
+                f"{dup_skipped} named instance row(s) would produce the same output as an "
+                f"earlier row under {self.dedupe_naming_mode.value} naming "
                 f"(axis values compared with epsilon {AXIS_VALUE_EPSILON}); "
-                "only the first row per coordinate set is generated by default. Use "
+                "only the first row per output identity is generated by default. Use "
                 "--all-fvar-instance-rows to emit every fvar record including repeats."
             )
 
@@ -2814,7 +2894,10 @@ class FontProcessor:
                 },
                 "source_italic": self.metadata.source_italic,
                 "coordinate_duplicate_row_count": count_coordinate_duplicate_rows(
-                    self.metadata.instances
+                    self.metadata.instances,
+                    self.metadata,
+                    self.stat_parser,
+                    default_naming_mode_for_instances(self.metadata.instances),
                 ),
             }
             print(json.dumps(output, indent=2))
@@ -2869,13 +2952,19 @@ class FontProcessor:
         self.metadata = self.analyzer.analyze()
         self.stat_parser = self.analyzer.stat_parser
 
-        selection, _ = instances_for_processing(self.metadata, self.config)
+        selection, _ = instances_for_processing(
+            self.metadata,
+            self.config,
+            self.stat_parser,
+            default_naming_mode_for_instances(self.metadata.instances),
+        )
 
         ui = InteractivePrompt(
             self.metadata,
             self.stat_parser,
             selection_instances=selection,
             coordinate_dedupe_active=self.config.skip_coordinate_duplicates,
+            naming_mode=default_naming_mode_for_instances(self.metadata.instances),
         )
 
         while True:
@@ -2982,7 +3071,7 @@ class FontProcessor:
         self.last_generator = generator
 
         selection, coord_dedupe_skipped = instances_for_processing(
-            self.metadata, self.config
+            self.metadata, self.config, self.stat_parser
         )
 
         instances_to_generate = selection
@@ -3003,6 +3092,7 @@ class FontProcessor:
                 self.stat_parser,
                 selection_instances=selection,
                 coordinate_dedupe_active=self.config.skip_coordinate_duplicates,
+                naming_mode=self.config.naming_mode,
             )
             ui._print_header("Named Instances")
             any_names_differ, has_dup_coords = ui._print_instances_table_with_naming(
@@ -3016,8 +3106,9 @@ class FontProcessor:
             )
             if coord_dedupe_skipped > 0:
                 StatusIndicator("info").add_message(
-                    f"Skipped {coord_dedupe_skipped} redundant fvar row(s) with duplicate "
-                    "coordinates (default; --all-fvar-instance-rows emits all rows)"
+                    f"Skipped {coord_dedupe_skipped} redundant fvar row(s) that would produce "
+                    f"the same output under {self.config.naming_mode.value} naming "
+                    "(default; --all-fvar-instance-rows emits all rows)"
                 ).emit()
 
         generated_files = []
@@ -3321,7 +3412,7 @@ Output Control
       Keep STAT table in generated instances
       
   %(prog)s font.ttf -y --all-fvar-instance-rows
-      Emit every fvar instance row, including duplicate coordinate sets
+      Emit every fvar instance row, including redundant coordinate/name pairs
       
   %(prog)s font.ttf -dry
       Preview what would be generated (no files created)
@@ -3408,7 +3499,7 @@ fvar-raw Names (-r)
         type=str,
         help=(
             "Comma-separated fvar instance slots (numbers in the '#' column; "
-            "duplicate-coordinate slots—purple row, gold #—are rejected unless "
+            "redundant fvar rows—purple row, gold #—are rejected unless "
             "--all-fvar-instance-rows)."
         ),
     )
@@ -3457,8 +3548,9 @@ fvar-raw Names (-r)
         dest="skip_coordinate_duplicates",
         action="store_true",
         help=(
-            "Keep only the first fvar instance row per coordinate set (default). "
-            f"Axes compared after snapping to multiples of {AXIS_VALUE_EPSILON}. "
+            "Keep only the first fvar row per output identity (default). "
+            f"Coordinates snap to multiples of {AXIS_VALUE_EPSILON}; output names follow "
+            "the active naming mode (-s / -fh / -fr). "
             "Same as default; kept for existing scripts."
         ),
     )
@@ -3467,8 +3559,9 @@ fvar-raw Names (-r)
         dest="skip_coordinate_duplicates",
         action="store_false",
         help=(
-            "Generate every fvar instance record, including rows whose coordinates match "
-            "an earlier row (disables default duplicate-coordinate skipping)."
+            "Generate every fvar instance record, including rows that would produce the same "
+            "output as an earlier row under the active naming mode "
+            "(disables default redundant-row skipping)."
         ),
     )
 
@@ -3687,6 +3780,7 @@ fvar-raw Names (-r)
                         # Resolve --instance slots (match interactive '#' column: inst.index + 1)
                         if processor.analyzer.load_and_validate():
                             processor.metadata = processor.analyzer.analyze()
+                            processor.stat_parser = processor.analyzer.stat_parser
                             try:
                                 if processor.metadata:
                                     slot_nums = [
@@ -3695,10 +3789,13 @@ fvar-raw Names (-r)
                                         if x.strip()
                                     ]
                                     processing_rows, _ = instances_for_processing(
-                                        processor.metadata, config
+                                        processor.metadata, config, processor.stat_parser
                                     )
                                     kept_slots = coordinate_first_kept_instance_indices(
-                                        processor.metadata.instances
+                                        processor.metadata.instances,
+                                        processor.metadata,
+                                        processor.stat_parser,
+                                        config.naming_mode,
                                     )
                                     mx_slot = (
                                         max(
@@ -3724,7 +3821,8 @@ fvar-raw Names (-r)
                                             and picked.index not in kept_slots
                                         ):
                                             StatusIndicator("warning").add_message(
-                                                f"--instance {slot} repeats coordinates of an earlier row "
+                                                f"--instance {slot} would repeat the output of an earlier row "
+                                                f"under {config.naming_mode.value} naming "
                                                 "(skipped by default; pass --all-fvar-instance-rows to include)"
                                             ).emit()
                                             continue
